@@ -239,6 +239,91 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   }
 }
 
+// Read range labels normalize numeric strings without changing execution args.
+// Null means an omitted optional field; malformed ranges must not be invented.
+{
+  const fixtures = [
+    [{ offset: 10, limit: 5 }, " · lines 10–14"],
+    [{ offset: "10", limit: "5" }, " · lines 10–14"],
+    [{ offset: " 10 ", limit: 5 }, " · lines 10–14"],
+    [{ offset: 10, limit: "5" }, " · lines 10–14"],
+    [{ offset: null, limit: "5" }, " · lines 1–5"],
+    [{ limit: 5 }, " · lines 1–5"],
+    [{ offset: "10", limit: null }, " · lines 10+"],
+    [{ offset: 10 }, " · lines 10+"],
+    [{ offset: null, limit: null }, ""],
+    [{}, ""],
+    [{ offset: "", limit: 5 }, ""],
+    [{ offset: "  ", limit: 5 }, ""],
+    [{ offset: "invalid", limit: 5 }, ""],
+    [{ offset: 10, limit: "invalid" }, ""],
+    [{ offset: NaN, limit: 5 }, ""],
+    [{ offset: 10, limit: Infinity }, ""],
+    [{ offset: true, limit: 5 }, ""],
+    [{ offset: 10, limit: {} }, ""],
+  ];
+  for (const [range, suffix] of fixtures) {
+    const args = Object.freeze({ path: "range-fixture.ts", ...range });
+    const component = tools.get("read").renderCall(args, theme, {
+      toolCallId: "read-range-fixture", expanded: true, executionStarted: true, state: {},
+    });
+    const output = stripTerminalSequences(component.render(120).join("\n")).trim();
+    assert.equal(output, `● read(range-fixture.ts${suffix})`, JSON.stringify(range));
+  }
+}
+
+// Edit diffs have a fixed, right-aligned number gutter before +/- markers.
+// Continuations keep both gutter columns blank and preserve code indentation.
+{
+  const diff = [
+    "    ...",
+    "   9 CONTEXT",
+    "- 10   DELETE " + "old words ".repeat(12),
+    "+100   ADD " + "新增内容 ".repeat(15),
+    " 101 ",
+    "    ...",
+  ].join("\n");
+  const renderEdit = (width, expanded = true, isError = false, details = { diff }) => {
+    const colors = [];
+    const editTheme = { ...theme, fg(color, text) { colors.push([color, text]); return text; } };
+    const component = tools.get("edit").renderResult(
+      { content: [{ type: "text", text: isError ? "Edit failed: original text not found" : "Updated" }], details },
+      { expanded, isPartial: false }, editTheme,
+      { toolCallId: "edit-gutter-fixture", executionStarted: true, isError, state: {} },
+    );
+    return { rows: component.render(width).map(stripTerminalSequences), colors };
+  };
+  for (const width of [38, 120]) {
+    const { rows, colors } = renderEdit(width);
+    const context = rows.find((line) => line.includes("CONTEXT"));
+    const removed = rows.find((line) => line.includes("DELETE"));
+    const added = rows.find((line) => line.includes("ADD"));
+    assert.equal(context.indexOf("9"), 7);
+    assert.equal(removed.indexOf("10"), 6);
+    assert.equal(added.indexOf("100"), 5);
+    assert.equal(removed.indexOf("-"), 9);
+    assert.equal(added.indexOf("+"), 9);
+    assert.equal(context.indexOf("CONTEXT"), 11);
+    assert.equal(removed.indexOf("DELETE"), 13); // two spaces of code indentation
+    assert.equal(added.indexOf("ADD"), 13);
+    assert.ok(rows.every((line) => visibleWidth(line) <= width));
+    assert.ok(rows.some((line) => /^   │ {7}old/.test(line)), "wrapped code starts after the gutter");
+    assert.ok(rows.filter((line) => line.includes("...")).every((line) => line.indexOf("...") === 11));
+    assert.ok(rows.some((line) => line.includes("101")), "blank source lines keep their number");
+    assert.ok(colors.some(([color, text]) => color === "toolDiffAdded" && text.startsWith("  ADD")));
+    assert.ok(colors.some(([color, text]) => color === "toolDiffRemoved" && text.startsWith("  DELETE")));
+    assert.ok(colors.some(([color, text]) => color === "toolDiffContext" && text === "CONTEXT"));
+    assert.ok(rows[0].includes("Updated · +1 -1"));
+  }
+  assert.ok(!renderEdit(80, false).rows.join("\n").includes("DELETE"));
+  assert.ok(renderEdit(80, true, true, {}).rows.join("\n").includes("Edit failed: original text not found"));
+  // Unknown diff formats must remain visible, not be dropped by the parser.
+  const raw = renderEdit(80, true, false, { diff: "@@ raw header @@\n+++ file\n-unparsed text" }).rows.join("\n");
+  assert.ok(raw.includes("@@ raw header @@"));
+  assert.ok(raw.includes("+++ file"));
+  assert.ok(raw.includes("-unparsed text"));
+}
+
 // User messages render as transparent, right-aligned chat bubbles. Short text
 // determines the bubble width; long text wraps at 75% of the terminal width.
 {
@@ -507,6 +592,66 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
   assert.ok(responseBoundaryText.includes("Done(1 tool call)"));
   assert.ok(!responseBoundaryText.includes("responding"));
+}
+
+// Late thinking must not reopen a group across an already-visible response.
+// Repeated snapshots of that response must not seal its subsequent tool group.
+{
+  const body = "INLINE_BOUNDARY_RESPONSE";
+  for (const order of ["thought-first", "text-first", "all-at-once"]) {
+    await emit("session_start", {}, sessionContext([]));
+    await emit("agent_start");
+    const timestamp = `inline-boundary-${order}`;
+    const thought = { type: "thinking", thinking: "Inspect the ledger" };
+    const text = { type: "text", text: body };
+    const calls = [
+      { type: "toolCall", id: `${timestamp}-a`, name: "obs_recall", arguments: {} },
+      { type: "toolCall", id: `${timestamp}-b`, name: "obs_recall", arguments: {} },
+    ];
+    const message = { role: "assistant", timestamp, stopReason: "toolUse", content: [thought, text, ...calls] };
+    if (order !== "all-at-once") {
+      const first = order === "text-first" ? text : thought;
+      await emit("message_update", { message: { ...message, content: [first] } });
+      await emit("message_update", { message: { ...message, content: [thought, text] } });
+    }
+    await emit("message_end", { message });
+    const assistantComponent = new AssistantMessageComponent(message);
+    const tools = calls.map((call) => new ToolExecutionComponent(
+      call.name, call.id, call.arguments, undefined,
+      { renderShell: "self", renderCall: () => new Text("BOUNDARY_TOOL_DETAIL", 0, 0) },
+      { requestRender() {} }, process.cwd(),
+    ));
+    for (let index = 0; index < calls.length; index++) {
+      tools[index].markExecutionStarted();
+      await emit("tool_execution_start", { toolCallId: calls[index].id, toolName: calls[index].name, args: {} });
+    }
+    // A late repeat of the same message must leave the new group running.
+    await emit("message_update", { message });
+    const initialThoughtRows = assistantComponent.render(120);
+    assistantComponent.handleMouse({ type: "click", button: "left", x: 4, y: 1, width: 120, height: initialThoughtRows.length });
+    const initialToolRows = tools[0].render(120);
+    tools[0].handleMouse({ type: "click", button: "left", x: 4, y: 1, width: 120, height: initialToolRows.length });
+    const render = () => [
+      ...assistantComponent.render(120), ...tools.flatMap((tool) => tool.render(120)),
+    ].map(stripTerminalSequences);
+    const rows = render();
+    const bodyY = rows.findIndex((line) => line.includes(body));
+    const runningY = rows.findIndex((line) => line.includes("Running("));
+    assert.ok(rows.some((line) => line.includes("Done(1 thought)")), `${order}: ${rows.join("\n")}`);
+    assert.ok(runningY > bodyY, `${order}: tools must start a separate group after the response`);
+    assert.match(rows[runningY], /Running\(2 tool calls/);
+    assert.equal(rows.filter((line) => line.includes(body)).length, 1);
+    assert.ok(rows.slice(0, bodyY).some((line) => line.includes("[↑ Collapse]")));
+    assert.ok(rows.at(-1).includes("[↑ Collapse]"));
+    // Folding the thought group must neither hide the response nor tool group.
+    assistantComponent.handleMouse({ type: "click", button: "left", x: 4, y: 1, width: 120, height: assistantComponent.render(120).length });
+    const collapsed = render().join("\n");
+    assert.ok(collapsed.includes(body));
+    assert.ok(collapsed.includes("Running(2 tool calls"));
+    assert.ok(collapsed.includes("obs_recall"));
+    await emit("agent_settled");
+    assert.ok(!render().join("\n").includes("Running("));
+  }
 }
 
 // A group closed before its root tool completed must not keep consuming the

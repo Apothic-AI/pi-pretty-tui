@@ -37,6 +37,10 @@ Displayed custom messages without their own renderer use one generic accent-colo
 
 Pi's direct internal `showStatus()` feedback is transient: it appears only in the status line above the editor, a newer status replaces it, and a ten-second timer removes it. It never enters the transcript or activity timeline and is cleared on reload. In clean mode, `Ctrl+T` and `Ctrl+O` only show short hints to click the corresponding disclosure; neither changes visibility or Pi's Thinking setting. In full and compact modes, both shortcuts keep Pi's native behaviour.
 
+Visible assistant text remains outside activity trees even when a later update to the same message introduces thinking. Repeated updates do not close a separate, subsequent tool group.
+
+`read` range labels accept numeric strings and omitted/null fields without concatenating line numbers; malformed range values omit the label. Expanded `edit` diffs use a fixed, right-aligned line-number gutter followed by a separate `+`/`-` column. Wrapped code aligns with the content column, preserving code indentation and theme diff colors.
+
 ## Error presentation
 
 In clean mode, standalone errors keep their original title and complete text in a compact `✕ Error · reason` layout. Consecutive errors with exactly the same source type, title, and full text share one visible row with a dim `×2` / `×3` count. Other transcript components break the run; errors carrying thought/tool/visible-response content are not folded. This is UI-only: session records and original message components remain unchanged. Long errors wrap without an added preview truncation; full/compact modes keep native presentation.
@@ -88,7 +92,7 @@ The suite covers live and restored activity timelines, retries and terminal stat
 
 ## Compatibility notice
 
-The current development and regression-test baseline is **Pi 1.1.0**. User chat bubbles support its direct Markdown layout, keeping their transparent background and content-sized width. Nested execution requires Pi 0.99.0 or later; this is a feature requirement, not a promise that every older Pi release is tested.
+The current development and regression-test baseline is **Pi 1.3.0**. User chat bubbles support its direct Markdown layout, keeping their transparent background and content-sized width. Nested execution requires Pi 0.99.0 or later; this is a feature requirement, not a promise that every older Pi release is tested.
 
 Tool rendering uses Pi's documented extension APIs. Active-tool state follows Pi's built-in execution transitions through its exported interactive components. Clean-mode thought details use the activity hierarchy's own disclosure state; full and compact modes retain Pi's built-in Thinking visibility control. Rendering native user messages as adaptive chat bubbles, rounding the native prompt editor, changing unordered-list markers, and enhancing fenced code blocks require reload-safe runtime patches because Pi does not currently expose public renderer hooks for those presentation details. Markdown enhancements are activated only while rendering user and assistant messages in the main transcript; Markdown created by extension overlays keeps Pi's native layout. Markdown parsing, syntax highlighting, and terminal semantic zones remain handled by Pi.
 

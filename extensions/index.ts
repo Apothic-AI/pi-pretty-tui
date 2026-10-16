@@ -2462,6 +2462,22 @@ export default function prettyTui(pi: ExtensionAPI) {
   const nonEmptyLines = (value: string): number =>
     value ? value.split("\n").filter((line) => line.length > 0).length : 0;
 
+  // Normalize display values only; null means omitted, as in native Pi labels.
+  // Malformed values hide the range rather than inventing line numbers.
+  const readLineRange = (offset: unknown, limit: unknown): string => {
+    if (offset == null && limit == null) return "";
+    const parse = (value: unknown): number | undefined => {
+      if (typeof value === "string" && value.trim() !== "") value = Number(value);
+      return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+    };
+    const start = offset == null ? 1 : parse(offset);
+    if (start === undefined) return "";
+    if (limit == null) return ` · lines ${start}+`;
+    const count = parse(limit);
+    if (count === undefined) return "";
+    return ` · lines ${start}–${start + count - 1}`;
+  };
+
   type DisplayValue = string | (() => string);
   type DisplayRow = {
     prefix: DisplayValue;
@@ -2548,6 +2564,28 @@ export default function prettyTui(pi: ExtensionAPI) {
     return block(rows);
   };
 
+  // Pi diffs encode the marker before the padded line number. Move it into
+  // its own column and keep the whole gutter out of content word wrapping.
+  const editDiffLayout = (theme: any, diff: string): ((line: string) => DisplayRow) => {
+    const parse = (line: string) => /^([ +\-]) *(\d+) (.*)$/.exec(line);
+    const numberWidth = diff.split("\n").reduce((width, line) => Math.max(width, parse(line)?.[2].length ?? 0), 1);
+    const gutterWidth = numberWidth + 3;
+    return (line) => {
+      const match = parse(line);
+      const marker = match?.[1] ?? (
+        line.startsWith("+") && !line.startsWith("+++") ? "+" :
+        line.startsWith("-") && !line.startsWith("---") ? "-" : " "
+      );
+      const color = marker === "+" ? "toolDiffAdded" : marker === "-" ? "toolDiffRemoved" : "toolDiffContext";
+      const gutter = match ? `${match[2].padStart(numberWidth)} ${marker} ` : " ".repeat(gutterWidth);
+      return {
+        prefix: theme.fg(color, gutter),
+        continuation: " ".repeat(gutterWidth),
+        content: theme.fg(color, match ? match[3] : /^\s+\.\.\.$/.test(line) ? "..." : line),
+      };
+    };
+  };
+
   const result = (
     theme: any,
     summary: string,
@@ -2556,6 +2594,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     error = false,
     summaryIsStyled = false,
     outputStyle: (line: string) => string = (line) => theme.fg("dim", line),
+    outputLayout?: (line: string) => DisplayRow,
   ) => {
     const rows: DisplayRow[] = [{
       prefix: theme.fg("dim", "└  "),
@@ -2570,10 +2609,11 @@ export default function prettyTui(pi: ExtensionAPI) {
       const omitted = lines.length - shown.length;
       for (let index = 0; index < shown.length; index++) {
         const isLast = index === shown.length - 1 && omitted === 0;
+        const layout = outputLayout?.(shown[index]);
         rows.push({
-          prefix: theme.fg("dim", isLast ? "   └ " : "   │ "),
-          continuation: isLast ? "     " : theme.fg("dim", "   │ "),
-          content: outputStyle(shown[index] || " "),
+          prefix: theme.fg("dim", isLast ? "   └ " : "   │ ") + (layout?.prefix ?? ""),
+          continuation: (isLast ? "     " : theme.fg("dim", "   │ ")) + (layout?.continuation ?? ""),
+          content: layout?.content ?? outputStyle(shown[index] || " "),
         });
       }
       if (omitted > 0) {
@@ -3898,7 +3938,15 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const closeAtAssistantBoundary = (message: any, activity: string): boolean => {
     const key = assistantMessageKey(message);
-    if (assistantBoundaryKeys.has(key)) return false;
+    if (assistantBoundaryKeys.has(key)) {
+      // A later snapshot can introduce thinking after text already sealed this
+      // message. Seal that newly-created thought group too, but do not let
+      // repeated text updates close a different, subsequent tool group.
+      const thought = activityTimeline.memberForThinking(key);
+      const thoughtGroup = thought ? activityTimeline.groupForMember(thought.id) : undefined;
+      if (!thoughtGroup || activityTimeline.currentGroup()?.id !== thoughtGroup.id ||
+        activityTimeline.isSettled(thoughtGroup.id)) return false;
+    }
     assistantBoundaryKeys.add(key);
     cleanRun.activity = activity;
     finishCleanGroup(activity);
@@ -4181,9 +4229,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {
       if (hideCleanTool(context.toolCallId, context.expanded, context.executionStarted)) return cleanToolCall(theme, readLabel, context.toolCallId);
-      const range = args.offset || args.limit
-        ? ` · lines ${args.offset ?? 1}${args.limit ? `–${(args.offset ?? 1) + args.limit - 1}` : "+"}`
-        : "";
+      const range = readLineRange(args.offset, args.limit);
       return call(theme, readLabel, `${args.path}${range}`, context.state);
     },
     renderResult(toolResult: any, options: any, theme: any, context: any) {
@@ -4294,6 +4340,7 @@ export default function prettyTui(pi: ExtensionAPI) {
           if (line.startsWith("-") && !line.startsWith("---")) return theme.fg("toolDiffRemoved", line);
           return theme.fg("toolDiffContext", line);
         },
+        !failed && diff ? editDiffLayout(theme, diff) : undefined,
       );
     },
   } as any);
