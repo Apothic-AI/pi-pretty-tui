@@ -1,18 +1,30 @@
+import { isNativeImageRow } from "./ansi-style.js";
+import { cardMargin, cardBackground, frameNativeRows, nativeFrameWidth } from "./full-frame.js";
+import { ThoughtPresentation } from "./thought-presentation.js";
+import { isThirdPartyTool, renderToolProjection, toolLabel, type ToolProjection } from "./tool-presentation.js";
 import { NestedTools, NESTED_SNAPSHOT_ENTRY } from "./nested-tools.js";
 import {
   AssistantMessageComponent,
   CustomEditor,
   CustomMessageComponent,
+  CompactionSummaryMessageComponent,
   InteractiveMode,
   ToolExecutionComponent,
   UserMessageComponent,
   createBashTool,
+  createBashToolDefinition,
   createEditTool,
+  createEditToolDefinition,
   createFindTool,
+  createFindToolDefinition,
   createGrepTool,
+  createGrepToolDefinition,
   createLsTool,
+  createLsToolDefinition,
   createReadTool,
+  createReadToolDefinition,
   createWriteTool,
+  createWriteToolDefinition,
   copyToClipboard,
   getAgentDir,
   getMarkdownTheme,
@@ -46,26 +58,7 @@ type PrettyTuiMode = "full" | "compact" | "clean";
 const CLEAN_TOOL_ACTIVITY_MIN_MS = 1000;
 const TRANSIENT_UI_STATUS_MS = 10_000;
 const RESPONSE_FOOTER_ENTRY_TYPE = "pretty-tui-response-footer";
-const SPECIALIZED_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
-const stripAnsiBackgrounds = (value: string): string =>
-  value.replace(/\x1b\[([0-9:;]*)m/g, (sequence, raw: string) => {
-    const fields = raw === "" ? [0] : raw.split(";").map((field) => Number(field));
-    const kept: number[] = [];
-    for (let index = 0; index < fields.length; index++) {
-      const field = fields[index];
-      if ((field >= 40 && field <= 49) || (field >= 100 && field <= 107)) continue;
-      if (field === 48) {
-        const mode = fields[index + 1];
-        if (mode === 5) index += 2;
-        else if (mode === 2) index += 4;
-        continue;
-      }
-      kept.push(field);
-    }
-    if (raw.includes(":") && /(?:^|;)48:/u.test(raw)) return "";
-    return kept.length > 0 ? `\x1b[${kept.join(";")}m` : "";
-  });
 type PrettyTuiConfig = {
   enabled?: boolean;
   mode?: PrettyTuiMode;
@@ -95,6 +88,10 @@ export default function prettyTui(pi: ExtensionAPI) {
     ? configuredMode
     : "clean";
   let cleanToolsExpanded = false;
+  // Full starts with thoughts open; an intentional Ctrl+T overrides that
+  // default for this runtime, independently of compact's initial setting.
+  let fullThinkingHidden = false;
+  let compactThinkingHidden = true;
   let cleanContextCompacted = false;
   let fullscreenTui = false;
   const mouseClickHitTests = new WeakMap<object, (event: any) => boolean>();
@@ -159,7 +156,7 @@ export default function prettyTui(pi: ExtensionAPI) {
   };
   const refreshLatestActivityWidget = () => {
     if (!currentExtensionUi?.setWidget) return;
-    if (renderMode !== "clean" || !latestActivityStatus) {
+    if (!latestActivityStatus) {
       if (latestActivityWidgetInstalled) {
         currentExtensionUi.setWidget(latestActivityWidgetKey, undefined);
         latestActivityWidgetInstalled = false;
@@ -261,7 +258,9 @@ export default function prettyTui(pi: ExtensionAPI) {
   const activityTimeline = new ActivityTimeline();
   const nestedTools = new NestedTools();
   const refreshNestedTools = (id: string) => {
-    cleanToolComponents.get(nestedTools.root(id))?.updateDisplay?.();
+    const owner = toolComponents.get(nestedTools.root(id));
+    owner?.updateDisplay?.();
+    owner?.ui?.requestRender?.();
     currentTui?.requestRender?.();
   };
   const revealedActivityGroups = new Set<string>();
@@ -283,7 +282,7 @@ export default function prettyTui(pi: ExtensionAPI) {
   const cleanCompactToolCallIds = new Set<string>();
   const cleanGroupToolCallIds = new Map<string, string[]>();
   const cleanToolCallGroupOwners = new Map<string, string>();
-  const cleanToolComponents = new Map<string, any>();
+  const toolComponents = new Map<string, any>();
   const cleanToolThemes = new Map<string, any>();
   const cleanToolNames = new Map<string, string>();
   let renderCleanGroupSummary = (_lastToolCallId: string, _width: number): string[] => [];
@@ -355,12 +354,14 @@ export default function prettyTui(pi: ExtensionAPI) {
     return group.toolCallIds[group.toolCallIds.length - 1];
   };
 
+  let fallbackActivityTheme: any;
   const defaultActivityTheme = () => {
     if (currentExtensionUi?.theme?.fg) return currentExtensionUi.theme;
     const markdownTheme = getMarkdownTheme();
-    return {
+    return fallbackActivityTheme ??= {
       fg: (color: string, text: string) => {
         if (color === "accent") return markdownTheme.listBullet(text);
+        if (color === "mdHeading") return markdownTheme.heading(text);
         // Session UI normally supplies Pi's active Theme above. Keep portable
         // semantic fallbacks for early startup and isolated renderer tests.
         if (color === "warning") return `\x1b[33m${text}\x1b[39m`;
@@ -443,7 +444,7 @@ export default function prettyTui(pi: ExtensionAPI) {
   const refreshActivityGroup = (group: ActivityGroup): void => {
     for (const child of group.members) {
       if (child.kind === "tool" && child.toolCallId) {
-        cleanToolComponents.get(child.toolCallId)?.updateDisplay?.();
+        toolComponents.get(child.toolCallId)?.updateDisplay?.();
       } else if (child.kind === "thinking" && child.messageKey) {
         thinkingComponents.get(child.messageKey)?.invalidate?.();
       } else if (child.kind === "update") {
@@ -468,7 +469,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     else collapsedActivityGroups.delete(group.id);
     for (const toolCallId of group.toolCallIds) {
       cleanCompactToolCallIds.delete(toolCallId);
-      const component = cleanToolComponents.get(toolCallId);
+      const component = toolComponents.get(toolCallId);
       if (component?.expanded) component.setExpanded(false);
     }
     for (const child of group.members) expandedThinkingMembers.delete(child.id);
@@ -580,7 +581,7 @@ export default function prettyTui(pi: ExtensionAPI) {
   };
 
   const renderStandaloneError = (member: ActivityMember, width: number, component?: any): string[] => {
-    const run = component ? errorRun(component) : { hidden: false, count: 1, compact: false };
+    const run = component && renderMode !== "full" ? errorRun(component) : { hidden: false, count: 1, compact: false };
     if (run.hidden) return [];
     const theme = defaultActivityTheme();
     const style = activityUpdateStyle(member, theme);
@@ -624,7 +625,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     width: number,
     component?: any,
   ): string[] => {
-    if (!activityGroupCollapsible(group)) return renderPendingActivityUpdate(member, width, component);
+    if (renderMode !== "clean" || !activityGroupCollapsible(group)) return renderPendingActivityUpdate(member, width, component);
     const position = activityMemberPosition(group, member);
     if (!activityGroupRevealed(group)) {
       return position.first
@@ -640,7 +641,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     event: any,
   ) => {
     const isLeftClick = event.type === "click" && event.button === "left";
-    if (!isLeftClick || !activityGroupCollapsible(group)) return undefined;
+    if (renderMode !== "clean" || !isLeftClick || !activityGroupCollapsible(group)) return undefined;
     const position = activityMemberPosition(group, member);
     if (!activityGroupRevealed(group)) {
       if (!position.first) return undefined;
@@ -693,7 +694,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         }
         const enabled = `Enabled — ${config.enabled !== false ? "on" : "off"}`;
         const full = `Full — full tool details and output${renderMode === "full" ? " (current)" : ""}`;
-        const compact = `Compact — concise summaries for all built-in tools${renderMode === "compact" ? " (current)" : ""}`;
+        const compact = `Compact — concise tool summaries and nested calls${renderMode === "compact" ? " (current)" : ""}`;
         const clean = `Clean — group supported tools into Running/Done status${renderMode === "clean" ? " (current)" : ""}`;
         const selected = await ctx.ui.select("pi-pretty-tui settings", [enabled, full, compact, clean]);
         if (!selected) return;
@@ -745,14 +746,9 @@ export default function prettyTui(pi: ExtensionAPI) {
       collapsedActivityGroups.clear();
       expandedThinkingMembers.clear();
       renderMode = requested;
-      if (renderMode === "clean") {
-        if (cleanRun.active && !cleanRun.settled) startWorkingElapsedTimer();
-        refreshLatestActivityWidget();
-      } else {
-        stopWorkingElapsedTimer();
-        clearLatestActivityStatus();
-      }
-      for (const component of cleanToolComponents.values()) component.updateDisplay?.();
+      if (cleanRun.active && !cleanRun.settled) startWorkingElapsedTimer();
+      refreshLatestActivityWidget();
+      for (const component of toolComponents.values()) component.updateDisplay?.();
       for (const component of thinkingComponents.values()) component.invalidate?.();
       try {
         saveRenderMode(renderMode);
@@ -784,7 +780,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (this.tui) currentTui = this.tui;
       currentPromptEditor = this;
       const indicator = this.workingStatusIndicator;
-      if (renderMode !== "clean" || indicator?.kind !== "working" || responseRunStartedAt === undefined) {
+      if (indicator?.kind !== "working" || responseRunStartedAt === undefined) {
         return originalEditorTopBorder.call(this, width, hiddenLineCount);
       }
       const elapsed = formatResponseDuration(Date.now() - responseRunStartedAt);
@@ -872,10 +868,8 @@ export default function prettyTui(pi: ExtensionAPI) {
     });
   }
 
-  // Render user prompts as right-aligned, content-sized chat bubbles while
-  // preserving Pi's Markdown component, wrapping, output padding, and OSC 133
-  // zones. Long messages stop at 75% of the terminal width; narrow terminals
-  // trade away the left gap before sacrificing readability.
+  // Clean uses content-sized bubbles; compact/full share full-width panels.
+  // Keep Pi's Markdown, mouse handling and OSC 133 zones in every mode.
   const userMessagePrototype = UserMessageComponent.prototype as any;
   const userMessagePatchKey = Symbol.for("pretty-tui.user-message-frame");
   if (!userMessagePrototype[userMessagePatchKey]) {
@@ -912,9 +906,9 @@ export default function prettyTui(pi: ExtensionAPI) {
           .map((line: string) => line.replace(/ +$/u, ""));
       const layout = (width: number) => {
         const terminalWidth = Math.max(1, width);
-        const rightPad = Math.min(outputPad, Math.max(0, terminalWidth - 1));
+        const rightPad = renderMode !== "clean" ? 0 : Math.min(outputPad, Math.max(0, terminalWidth - 1));
         const availableWidth = Math.max(1, terminalWidth - rightPad);
-        if (availableWidth < 4) {
+        if (availableWidth < (renderMode !== "clean" ? 8 : 4)) {
           return {
             framed: false,
             rightPad,
@@ -922,6 +916,16 @@ export default function prettyTui(pi: ExtensionAPI) {
             frameWidth: availableWidth,
             contentWidth: availableWidth,
             body: renderMarkdown(availableWidth),
+          };
+        }
+
+        if (renderMode !== "clean") {
+          const margin = cardMargin(terminalWidth);
+          const contentWidth = nativeFrameWidth(terminalWidth);
+          return {
+            framed: true, rightPad: margin, leftPad: margin,
+            frameWidth: terminalWidth - margin * 2, contentWidth,
+            body: renderMarkdown(contentWidth),
           };
         }
 
@@ -955,8 +959,8 @@ export default function prettyTui(pi: ExtensionAPI) {
         };
       };
       const border = (text: string) => currentExtensionUi?.theme?.fg
-        ? currentExtensionUi.theme.fg("mdLink", text)
-        : markdownTheme.link(text);
+        ? currentExtensionUi.theme.fg("mdHeading", text)
+        : markdownTheme.heading(text);
       const userText = typeof this.text === "string" ? this.text : "";
       const frame: Component = {
         render(width: number): string[] {
@@ -964,7 +968,12 @@ export default function prettyTui(pi: ExtensionAPI) {
           const left = " ".repeat(measured.leftPad);
           const right = " ".repeat(measured.rightPad);
           if (!measured.framed) {
-            return measured.body.map((line: string) => left + line + right);
+            return measured.body.map((line: string) => renderMode !== "clean"
+              ? cardBackground(line, width, defaultActivityTheme(), "toolPendingBg", "mdHeading") : left + line + right);
+          }
+          if (renderMode !== "clean") {
+            return frameNativeRows("User", measured.body, width, defaultActivityTheme(), undefined,
+              frame, "mdHeading", "", "mdHeading").lines;
           }
 
           const top = border("╭" + "─".repeat(Math.max(0, measured.frameWidth - 2)) + "╮");
@@ -1106,6 +1115,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       return true;
     };
     const patchedCustomRender = function (this: any, width: number): string[] {
+      if (renderMode === "full") return originalCustomRender.call(this, width);
       if (releaseSemanticCustomMessage(this)) {
         return originalCustomRender.call(this, width);
       }
@@ -1116,23 +1126,24 @@ export default function prettyTui(pi: ExtensionAPI) {
       // message_start event. Claim them at the component boundary so live
       // rendering matches transcript restoration instead of failing open to
       // the purple native box until the next reload.
-      if (!member && renderMode === "clean") {
+      if (!member) {
         member = addPersistentActivityUpdate(message);
       }
       const group = member ? activityTimeline.groupForMember(member.id) : undefined;
-      if (renderMode !== "clean" || !member || !group) {
+      if (!member || !group) {
         return originalCustomRender.call(this, width);
       }
       activityUpdateComponents.set(member.id, this);
       return renderActivityUpdateProjection(group, member, width);
     };
     const patchedCustomHandleMouse = function (this: any, event: any) {
+      if (renderMode === "full") return originalCustomHandleMouse?.call(this, event);
       if (releaseSemanticCustomMessage(this)) {
         return originalCustomHandleMouse?.call(this, event);
       }
       const member = activityTimeline.memberForUpdate(customMessageKey(this.message));
       const group = member ? activityTimeline.groupForMember(member.id) : undefined;
-      if (renderMode !== "clean" || !member || !group) {
+      if (!member || !group) {
         return originalCustomHandleMouse?.call(this, event);
       }
       return handleActivityUpdateMouse(group, member, event);
@@ -1163,20 +1174,79 @@ export default function prettyTui(pi: ExtensionAPI) {
     });
   }
 
+  // Keep Pi's compaction content and expansion state inside the shared panel.
+  const compactionPrototype = CompactionSummaryMessageComponent.prototype as any;
+  const compactionPatchKey = Symbol.for("pretty-tui.compaction-panel");
+  if (!compactionPrototype[compactionPatchKey]) {
+    const originalRender = compactionPrototype.render;
+    const originalHandleMouse = compactionPrototype.handleMouse;
+    const views = new WeakMap<object, { width: number; sourceOffset: number; frame: ReturnType<typeof frameNativeRows> }>();
+    const render = function (this: any, width: number): string[] {
+      if (renderMode === "clean") {
+        views.delete(this);
+        mouseClickHitTests.delete(this);
+        return originalRender.call(this, width);
+      }
+      const innerWidth = nativeFrameWidth(width);
+      const region = this.children[0];
+      // Native content begins with its [compaction] label and a spacer. The
+      // panel title replaces those two rows; the summary itself is untouched.
+      const content = region.child.children;
+      const sourceOffset = content.slice(0, 2).reduce((height: number, child: any) => height + child.render(innerWidth).length, 0);
+      const source = content.slice(2).flatMap((child: any) => child.render(innerWidth));
+      const theme = defaultActivityTheme();
+      const frame = frameNativeRows(`compaction ${this.expanded ? "▾" : "▸"}`, source, width, theme,
+        undefined, this, "customMessageLabel", "", "customMessageLabel", "customMessageBg");
+      views.set(this, { width: innerWidth, sourceOffset, frame });
+      mouseClickHitTests.set(this, (event) => event.y === 0 || frame.sourceRows.has(event.y));
+      return frame.lines.map((line) => isNativeImageRow(line) ? line : truncateToWidth(line, Math.max(1, width), ""));
+    };
+    const handleMouse = function (this: any, event: any) {
+      if (renderMode === "clean") return originalHandleMouse?.call(this, event);
+      render.call(this, event.width);
+      const view = views.get(this);
+      if (!view) return undefined;
+      if (event.y === 0 && event.type === "click" && event.button === "left") {
+        this.setExpanded(!this.expanded);
+        currentTui?.requestRender?.();
+        return { handled: true };
+      }
+      const sourceY = view.frame.sourceRows.get(event.y);
+      if (sourceY === undefined) return undefined;
+      const result = this.children[0].handleMouse?.({ ...event,
+        x: Math.max(0, event.x - view.frame.inset), y: sourceY + view.sourceOffset,
+        width: view.width, height: view.frame.sourceRows.size + view.sourceOffset,
+      });
+      if (result?.handled) currentTui?.requestRender?.();
+      return result;
+    };
+    compactionPrototype[compactionPatchKey] = { originalRender, originalHandleMouse };
+    compactionPrototype.render = render;
+    compactionPrototype.handleMouse = handleMouse;
+    pi.on("session_shutdown", () => {
+      if (compactionPrototype.render === render) compactionPrototype.render = originalRender;
+      if (compactionPrototype.handleMouse === handleMouse) compactionPrototype.handleMouse = originalHandleMouse;
+      if (compactionPrototype.render === originalRender && compactionPrototype.handleMouse === originalHandleMouse) {
+        delete compactionPrototype[compactionPatchKey];
+      }
+    });
+  }
+
   // Thinking and tools are peers in the transcript-first activity timeline.
-  // Assistant components keep Pi's native Markdown renderer, while clean mode
-  // projects each thinking run as a compact, independently expandable child.
+  // Assistant components keep Pi's native visible-answer Markdown renderer.
+  // All modes share thought content; only clean adds activity-group framing.
   const assistantPrototype = AssistantMessageComponent.prototype as any;
   const thinkingPatchKey = Symbol.for("pretty-tui.clean-thinking");
   if (!assistantPrototype[thinkingPatchKey]) {
     const originalUpdateContent = assistantPrototype.updateContent;
     const originalRender = assistantPrototype.render;
     const originalHandleMouse = assistantPrototype.handleMouse;
+    const originalSetHideThinkingBlock = assistantPrototype.setHideThinkingBlock;
+    const explicitThinkingVisibility = new WeakMap<object, boolean>();
     const originalMessageKey = Symbol("pretty-tui.original-assistant-message");
     const renderedModeKey = Symbol("pretty-tui.rendered-assistant-mode");
     const renderedExpansionKey = Symbol("pretty-tui.rendered-assistant-expansion");
     const cleanThinkingRenderCacheKey = Symbol("pretty-tui.clean-thinking-render-cache");
-    const cleanThinkingDetailKey = Symbol("pretty-tui.clean-thinking-detail");
 
     const assistantTerminalUpdate = (message: any): ActivityMember | undefined => {
       if (!assistantTerminalState(message)) return undefined;
@@ -1216,32 +1286,84 @@ export default function prettyTui(pi: ExtensionAPI) {
       currentTui?.requestRender?.();
     };
 
-    // Shared detail projection for a Thought, used both as a member of a tool
-    // group and as a standalone row. The cache records its theme because the
-    // same component can switch between the Markdown fallback and a real tool
-    // theme once the first tool of the group is constructed.
-    const thinkingDetailLines = (
-      owner: any,
-      text: string,
-      theme: any,
-      childWidth: number,
-    ): string[] => {
-      let detail = owner[cleanThinkingDetailKey];
-      if (!detail || detail.text !== text || detail.theme !== theme) {
-        detail = {
-          text,
-          theme,
-          component: new Markdown(text, 0, 0, owner.markdownTheme, {
-            color: (line: string) => theme.fg("muted", line),
-            italic: true,
-          }),
+    const thoughtPresentation = new ThoughtPresentation();
+    const fullThinkingVisibility = new WeakMap<object, boolean>();
+    const patchedSetHideThinkingBlock = function (this: any, hide: boolean) {
+      if (renderMode !== "clean") explicitThinkingVisibility.set(this, !hide);
+      if (renderMode === "full") fullThinkingVisibility.set(this, !hide);
+      return originalSetHideThinkingBlock.call(this, hide);
+    };
+    const panelAssistantViews = new WeakMap<object, { rows: Map<number, { sourceY: number; inset: number }>; width: number; height: number }>();
+    const renderPanelAssistant = function (this: any, width: number): string[] {
+      const innerWidth = nativeFrameWidth(width);
+      const nativeLines = originalRender.call(this, innerWidth);
+      const rows = new Map<number, { sourceY: number; inset: number }>();
+      const thoughtRows = new Set<number>();
+      const output: string[] = [];
+      const children = this.contentContainer.children;
+      let sourceY = 0;
+      let thoughtRun = 0;
+      const previews: string[] = [];
+      if (renderMode === "compact") {
+        const message = this[originalMessageKey] ?? this.lastMessage;
+        let run: string[] = [];
+        const finishRun = () => {
+          if (run.length) previews.push(run.join("\n\n").split(/\r\n|\r|\n/).find((line) => line.trim())?.trim() ?? "");
+          run = [];
         };
-        owner[cleanThinkingDetailKey] = detail;
+        for (const item of message?.content ?? []) {
+          if (item.type === "thinking") {
+            if (item.thinking?.trim()) run.push(item.thinking.trim());
+          } else finishRun();
+        }
+        finishRun();
       }
-      const lines: string[] = detail.component.render(Math.max(1, childWidth));
-      return lines.map((line, index) =>
-        theme.fg("dim", index === lines.length - 1 ? "  └ " : "  │ ") + line
-      );
+      for (let index = 0; index < children.length; index++) {
+        const child = children[index];
+        const childLines = child.render(innerWidth);
+        const isThought = Boolean(child.onMouse && child.child);
+        if (isThought || child instanceof Markdown && childLines.length) {
+          let height = childLines.length;
+          // Adjacent native text blocks belong to the same answer card. Keep
+          // native paragraph order and source coordinates, not copied text.
+          if (!isThought) {
+            while (children[index + 1] instanceof Markdown) {
+              height += children[++index].render(innerWidth).length;
+            }
+          }
+          const runIndex = thoughtRun;
+          const hidden = isThought && (this.thinkingVisibilityOverrides.get(thoughtRun++) ?? this.hideThinkingBlock);
+          const source = renderMode === "compact" && hidden
+            ? [defaultActivityTheme().fg("thinkingText", truncateToWidth(previews[runIndex] ?? "", innerWidth, "…"))]
+            : nativeLines.slice(sourceY, sourceY + height);
+          const role = isThought ? "mdLink" : "text";
+          const baseLabel = isThought ? this.isStreaming ? "thinking" : "thought" : "Assistant";
+          const label = isThought && renderMode === "compact" ? `${baseLabel} ${hidden ? "▸" : "▾"}` : baseLabel;
+          const frame = frameNativeRows(label, source, width, defaultActivityTheme(), undefined, child, role, "", role);
+          for (const [y, nativeY] of frame.sourceRows) {
+            rows.set(output.length + y, { sourceY: sourceY + nativeY, inset: frame.inset });
+            if (isThought) thoughtRows.add(output.length + y);
+          }
+          if (isThought && height) {
+            rows.set(output.length, { sourceY, inset: frame.inset });
+            thoughtRows.add(output.length);
+          }
+          output.push(...frame.lines);
+          sourceY += height;
+        } else {
+          for (let y = 0; y < childLines.length; y++) rows.set(output.length + y, { sourceY: sourceY + y, inset: 0 });
+          output.push(...nativeLines.slice(sourceY, sourceY + childLines.length));
+          sourceY += childLines.length;
+        }
+      }
+      if (renderMode === "compact") {
+        const terminal = assistantTerminalUpdate(this[originalMessageKey] ?? this.lastMessage);
+        if (terminal) output.push(...renderPendingActivityUpdate(terminal, width, this));
+      }
+      panelAssistantViews.set(this, { rows, width: innerWidth, height: nativeLines.length });
+      mouseClickHitTests.set(this, (event) => thoughtRows.has(event.y));
+      return renderMode === "compact" && width < 8
+        ? output.map((line) => isNativeImageRow(line) ? line : truncateToWidth(line, Math.max(1, width), "")) : output;
     };
 
     const patchedUpdateContent = function (this: any, message: any, isStreaming = this.isStreaming) {
@@ -1250,8 +1372,13 @@ export default function prettyTui(pi: ExtensionAPI) {
       this[renderedExpansionKey] = cleanToolsExpanded;
       this.lastMessage = message;
       if (renderMode !== "clean") {
-        originalUpdateContent.call(this, message, isStreaming);
+        this.hideThinkingBlock = renderMode === "full"
+          ? !(fullThinkingVisibility.get(this) ?? !fullThinkingHidden)
+          : !(explicitThinkingVisibility.get(this) ?? !compactThinkingHidden);
+        originalUpdateContent.call(this, renderMode === "compact" && assistantTerminalState(message)
+          ? { ...message, errorMessage: undefined, stopReason: "stop" } : message, isStreaming);
         this.lastMessage = message;
+        if (eligibleThinking(message)) thinkingComponents.set(assistantMessageKey(message), this);
         return;
       }
       const groupedThinking = eligibleThinking(message);
@@ -1263,15 +1390,17 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       const previousHideThinkingBlock = this.hideThinkingBlock;
       this.hideThinkingBlock = false;
-      // Clean mode owns grouped thinking completely. Removing it from Pi's
-      // native content tree also removes the native MouseRegion that would
+      // Shared thought presentation owns thinking completely. Removing it from
+      // Pi's native content tree also removes the native MouseRegion that would
       // otherwise toggle a second, unrelated `Thinking...` block.
       const displayMessage =
         groupedThinking && Array.isArray(message?.content)
           ? { ...message, content: message.content.filter((item: any) => item.type !== "thinking") }
           : message;
       try {
-        originalUpdateContent.call(this, displayMessage, isStreaming);
+        originalUpdateContent.call(this, assistantTerminalState(message)
+          ? { ...displayMessage, errorMessage: undefined, stopReason: "stop" }
+          : displayMessage, isStreaming);
       } finally {
         this.hideThinkingBlock = previousHideThinkingBlock;
       }
@@ -1286,14 +1415,17 @@ export default function prettyTui(pi: ExtensionAPI) {
       ) {
         patchedUpdateContent.call(this, message, this.isStreaming);
       }
-      if (renderMode !== "clean") return originalRender.call(this, width);
+      if (renderMode !== "clean") return renderPanelAssistant.call(this, width);
       const terminalMember = assistantTerminalUpdate(message);
       if (!eligibleThinking(message)) {
         if (!terminalMember) return originalRender.call(this, width);
         const terminalGroup = activityTimeline.groupForMember(terminalMember.id);
         if (!terminalGroup) return originalRender.call(this, width);
         activityUpdateComponents.set(terminalMember.id, this);
-        return renderActivityUpdateProjection(terminalGroup, terminalMember, width, this);
+        return [
+          ...renderActivityUpdateProjection(terminalGroup, terminalMember, width, this),
+          ...(visibleAssistantText(message) ? originalRender.call(this, width) : []),
+        ];
       }
 
       const key = assistantMessageKey(message);
@@ -1311,10 +1443,9 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
       const position = activityMemberPosition(group, member);
       const visibleLines = visibleAssistantText(message) ? originalRender.call(this, width) : [];
-      // Pi's native renderer prints its own error line for messages with no
-      // tool calls, so this component only adds the styled alert card when no
-      // visible text can carry it.
-      const terminalLines = terminalMember && visibleLines.length === 0
+      // Native errors are filtered above; append the shared alert exactly once
+      // while preserving any partial visible answer outside the thought block.
+      const terminalLines = terminalMember
         ? renderPendingActivityUpdate(terminalMember, width)
         : [];
       const appendTail = (activityLines: string[]) => {
@@ -1343,7 +1474,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       );
       // Clean mode owns thought disclosure: revealing a group shows the thought
       // member, while only a member click (or Ctrl+O) reveals its full text.
-      const expanded = cleanToolsExpanded || expandedThinkingMembers.has(member.id);
+      const expanded = expandedThinkingMembers.has(member.id) || (explicitThinkingVisibility.get(this) ?? cleanToolsExpanded);
       const settledOwner = position.first ? activityGroupOwner(group) : undefined;
       // A group without tools has no durable summary, so its own boundary is
       // the signal that it finished.
@@ -1367,12 +1498,10 @@ export default function prettyTui(pi: ExtensionAPI) {
         return appendTail(cached.lines);
       }
       const stateLabel = this.isStreaming ? "thinking" : "thought";
-      const label = truncateToWidth(stateLabel, Math.max(1, childWidth - 2), "…");
-      const header = groupTheme.fg("mdLink", "● ") +
-        groupTheme.fg("text", groupTheme.bold(label));
+      const header = thoughtPresentation.header(stateLabel, childWidth, groupTheme);
       let contentLines: string[] = [header];
       if (expanded) {
-        contentLines.push(...thinkingDetailLines(
+        contentLines.push(...thoughtPresentation.details(
           this,
           member.thinking ?? thinkingText(message),
           groupTheme,
@@ -1405,7 +1534,15 @@ export default function prettyTui(pi: ExtensionAPI) {
 
     const handleAssistantTranscriptMouse = function (this: any, event: any) {
       const message = this[originalMessageKey] ?? this.lastMessage;
-      if (renderMode !== "clean") return originalHandleMouse.call(this, event);
+      if (renderMode !== "clean") {
+        patchedRender.call(this, event.width);
+        const view = panelAssistantViews.get(this);
+        const row = view?.rows.get(event.y);
+        if (!view || !row) return undefined;
+        return originalHandleMouse.call(this, { ...event,
+          x: Math.max(0, event.x - row.inset), y: row.sourceY, width: view.width, height: view.height,
+        });
+      }
       if (!eligibleThinking(message)) {
         const terminalMember = assistantTerminalUpdate(message);
         const terminalGroup = terminalMember
@@ -1478,6 +1615,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       originalHandleMouse,
       patchedHandleMouse,
     };
+    assistantPrototype.setHideThinkingBlock = patchedSetHideThinkingBlock;
     assistantPrototype.updateContent = patchedUpdateContent;
     assistantPrototype.render = patchedRender;
     assistantPrototype.handleMouse = patchedHandleMouse;
@@ -1485,6 +1623,9 @@ export default function prettyTui(pi: ExtensionAPI) {
     pi.on("session_shutdown", () => {
       const patch = assistantPrototype[thinkingPatchKey];
       if (!patch) return;
+      if (assistantPrototype.setHideThinkingBlock === patchedSetHideThinkingBlock) {
+        assistantPrototype.setHideThinkingBlock = originalSetHideThinkingBlock;
+      }
       if (patch.patchedUpdateContent === assistantPrototype.updateContent) {
         assistantPrototype.updateContent = patch.originalUpdateContent;
       }
@@ -1682,10 +1823,8 @@ export default function prettyTui(pi: ExtensionAPI) {
       message: string,
       type?: "info" | "warning" | "error",
     ) {
-      if (renderMode !== "clean") {
-        return originalShowExtensionNotify.call(this, message, type);
-      }
       const severity: ActivitySeverity = type ?? "info";
+      if (renderMode === "full") return nativeExtensionNotify.call(this, message, severity);
       if (!appendRuntimeActivityUpdate(this, message, severity)) {
         nativeExtensionNotify.call(this, message, severity);
       }
@@ -1693,6 +1832,13 @@ export default function prettyTui(pi: ExtensionAPI) {
 
     const patchedToggleThinkingBlockVisibility = function (this: any) {
       if (renderMode !== "clean") {
+        if (renderMode === "full") {
+          this.hideThinkingBlock = fullThinkingHidden;
+          fullThinkingHidden = !fullThinkingHidden;
+        } else {
+          this.hideThinkingBlock = compactThinkingHidden;
+          compactThinkingHidden = !compactThinkingHidden;
+        }
         return originalToggleThinkingBlockVisibility.call(this);
       }
       // Do not change Pi's persisted hideThinkingBlock setting in clean mode.
@@ -1704,7 +1850,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     };
 
     const patchedShowStatus = function (this: any, message: string) {
-      if (renderMode !== "clean") return originalShowStatus.call(this, message);
+      if (renderMode === "full") return originalShowStatus.call(this, message);
       const [firstLine, ...remainingLines] = String(message).split("\n");
       setLatestActivityStatus({
         title: firstLine || "Status",
@@ -1715,13 +1861,15 @@ export default function prettyTui(pi: ExtensionAPI) {
     };
 
     const patchedShowWarning = function (this: any, message: string) {
-      if (renderMode !== "clean" || !appendRuntimeActivityUpdate(this, message, "warning")) {
+      if (renderMode === "full") return originalShowWarning.call(this, message);
+      if (!appendRuntimeActivityUpdate(this, message, "warning")) {
         return originalShowWarning.call(this, message);
       }
     };
 
     const patchedShowError = function (this: any, message: string) {
-      if (renderMode !== "clean" || !appendRuntimeActivityUpdate(this, message, "error")) {
+      if (renderMode === "full") return originalShowError.call(this, message);
+      if (!appendRuntimeActivityUpdate(this, message, "error")) {
         return originalShowError.call(this, message);
       }
     };
@@ -1772,9 +1920,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
       // A mode switch can keep existing components rather than rebuild them.
       const component: Component = {
-        render: (width: number) => renderMode === "clean"
-          ? renderActivityUpdateProjection(group, member, width)
-          : nativeNodes.flatMap((node) => node.render(width)),
+        render: (width: number) => renderActivityUpdateProjection(group, member, width),
         invalidate() {},
         handleMouse: (event: any) => renderMode === "clean"
           ? handleActivityUpdateMouse(group, member, event)
@@ -1808,7 +1954,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         if (!group) continue;
         mountActivityUpdate(
           cacheNoticeHost.current, group, member, [],
-          cleanToolComponents.get(toolCallId),
+          toolComponents.get(toolCallId),
         );
         refreshActivityGroup(group);
         cacheNoticeHost.current?.ui?.requestRender?.();
@@ -1817,7 +1963,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     flushDeferredCacheNotices = flushPendingCacheNotices;
 
     const patchedAddCacheMissNotice = function (this: any, miss: any) {
-      if (renderMode !== "clean" || !this.chatContainer?.addChild) {
+      if (!this.chatContainer?.addChild) {
         return originalAddCacheMissNotice.call(this, miss);
       }
       // Let Pi decide thresholds, formatting and cause labels. Capture its
@@ -1876,7 +2022,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (!group) return;
       mountActivityUpdate(
         this, group, member, nativeNodes,
-        anchor?.toolCallId ? cleanToolComponents.get(anchor.toolCallId) : undefined,
+        anchor?.toolCallId ? toolComponents.get(anchor.toolCallId) : undefined,
       );
       const component = activityUpdateComponents.get(member.id);
       if (component && message) cacheNoticeOwners.set(component, message);
@@ -2520,10 +2666,11 @@ export default function prettyTui(pi: ExtensionAPI) {
     prefix: () => {
       const status = (state.compactToolStatus ?? "running") as ToolStatus;
       const color = status === "success" ? "success" : status === "error" ? "error" : "dim";
+      if (renderMode === "compact") return name === "bash" ? theme.fg("toolTitle", "$ ") : "";
       return theme.fg(color, "● ");
     },
-    continuation: "  ",
-    content:
+    continuation: renderMode === "compact" && name !== "bash" ? "" : "  ",
+    content: renderMode === "compact" ? theme.fg("muted", detail) :
       theme.fg("text", theme.bold(name)) +
       theme.fg("dim", "(") +
       theme.fg("muted", detail) +
@@ -2769,65 +2916,6 @@ export default function prettyTui(pi: ExtensionAPI) {
     settled: false,
   };
 
-  const toolLabel = (toolName: string, label?: string): string => label || toolName;
-
-  const conciseThirdPartyArgs = (args: any): string => {
-    if (!args || typeof args !== "object" || Array.isArray(args)) return "";
-    const sensitive = /(?:token|secret|password|authorization|credential|api[_-]?key)/iu;
-    const preferred = ["path", "query", "url", "offset", "id"];
-    const entries = Object.entries(args)
-      .filter(([key, value]) => !sensitive.test(key) && ["string", "number", "boolean"].includes(typeof value))
-      .sort(([left], [right]) => {
-        const leftRank = preferred.indexOf(left);
-        const rightRank = preferred.indexOf(right);
-        return (leftRank < 0 ? preferred.length : leftRank) -
-          (rightRank < 0 ? preferred.length : rightRank);
-      })
-      .slice(0, 2)
-      .map(([key, value]) => {
-        const safeValue = String(value)
-          .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/giu, "$1…:…@")
-          .replace(/([?&](?:token|secret|password|api[_-]?key)=)[^&\s]+/giu, "$1…");
-        const rendered = truncateToWidth(safeValue, 36, "…");
-        return `${key}=${rendered}`;
-      });
-    return entries.join(" · ");
-  };
-
-  const thirdPartyResultSummary = (component: any): string => {
-    const detailsError = component.result?.details?.error;
-    const firstText = component.result?.content?.find(
-      (item: any) => item?.type === "text" && typeof item.text === "string" && item.text.length > 0,
-    )?.text;
-    const text = String(typeof detailsError === "string" ? detailsError : firstText ?? "");
-    const boundedText = text.slice(0, 512);
-    const newline = boundedText.indexOf("\n");
-    const boundedFirstLine = boundedText.slice(0, newline < 0 ? boundedText.length : newline);
-    const firstLine = stripTerminalSequences(boundedFirstLine).trim();
-    if (firstLine) return truncateToWidth(firstLine, 72, "…");
-    if (component.result) return component.result.isError ? "Failed" : "Done";
-    return component.executionStarted ? "Running…" : "Pending";
-  };
-
-  const renderThirdPartyCompact = (component: any, width: number, theme: any): string[] => {
-    const label = toolLabel(component.toolName, component.toolDefinition?.label);
-    const args = conciseThirdPartyArgs(component.args);
-    const dotColor = component.result?.isError
-      ? "error"
-      : component.result && !component.isPartial
-        ? "success"
-        : "dim";
-    const title = theme.fg(dotColor, "● ") +
-      theme.fg("text", theme.bold(label)) +
-      (args ? theme.fg("muted", `(${args})`) : "");
-    const result = thirdPartyResultSummary(component);
-    const resultColor = component.result?.isError ? "error" : "muted";
-    return [
-      truncateToWidth(title, Math.max(1, width), "…"),
-      theme.fg(resultColor, truncateToWidth(`  └ ${result}`, Math.max(1, width), "…")),
-    ];
-  };
-
   const clearToolActivityHolds = () => {
     for (const hold of toolActivityHolds.values()) {
       if (hold.timer) clearTimeout(hold.timer);
@@ -2937,6 +3025,38 @@ export default function prettyTui(pi: ExtensionAPI) {
     const originalToolHandleMouse = toolExecutionPrototype.handleMouse;
     const renderedModeKey = Symbol("pretty-tui.tool-rendered-mode");
     const cleanChildRenderCacheKey = Symbol("pretty-tui.clean-child-render-cache");
+    const standaloneViews = new WeakMap<object, { projection: ToolProjection; offset: number; width: number }>();
+    const projectTool = (owner: any, width: number, theme: any, mode: "compact" | "full") =>
+      renderToolProjection(owner, width, theme, {
+        mode, nested: nestedTools, nestedExpanded: Boolean(owner.expanded), panels: renderMode !== "clean",
+        renderNative: (nativeWidth) => originalToolRender.call(owner, nativeWidth),
+      });
+    const handleProjectionMouse = (owner: any, projection: ToolProjection, event: any) => {
+      const isClick = event.type === "click" && event.button === "left";
+      const action = projection.actions.get(event.y);
+      if (isClick && action) {
+        nestedTools.toggle(action, Boolean(owner.expanded));
+        owner.updateDisplay?.();
+        owner.ui?.requestRender?.();
+        return { handled: true };
+      }
+      if (isClick && projection.toggleRows.has(event.y)) {
+        originalSetExpanded.call(owner, !owner.expanded);
+        owner.ui?.requestRender?.();
+        return { handled: true };
+      }
+      const native = projection.native;
+      const sourceY = projection.sourceRows?.get(event.y);
+      if (native && (projection.sourceRows ? sourceY !== undefined : event.y >= native.y && event.y < native.y + native.height)) {
+        return originalToolHandleMouse.call(owner, {
+          ...event, x: Math.max(0, event.x - native.x),
+          y: sourceY ?? event.y - native.y + native.sourceY,
+          width: native.width, height: native.height + native.sourceY,
+        });
+      }
+      // Projected rows must never be interpreted as native renderer rows.
+      return isClick ? { handled: true } : undefined;
+    };
     const revealCleanGroup = revealActivityGroup;
     const collapseCleanGroup = collapseActivityGroup;
     const patchedMarkExecutionStarted = function (this: any) {
@@ -2972,7 +3092,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       return originalSetExpanded.call(this, expanded);
     };
     const patchedToolRender = function (this: any, width: number): string[] {
-      cleanToolComponents.set(this.toolCallId, this);
+      toolComponents.set(this.toolCallId, this);
       knownToolCallIds.add(this.toolCallId);
       const member = activityTimeline.addTool(this.toolCallId, this.toolName);
       cleanToolNames.set(
@@ -2985,7 +3105,24 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
 
       const group = activityTimeline.groupForMember(member.id);
-      if (renderMode !== "clean" || !group) return originalToolRender.call(this, width);
+      if (renderMode !== "clean" || !group) {
+        const projection = renderMode !== "clean"
+          ? projectTool(this, width, defaultActivityTheme(), renderMode)
+          : undefined;
+        if (!projection) {
+          standaloneViews.delete(this);
+          mouseClickHitTests.delete(this);
+          return originalToolRender.call(this, width);
+        }
+        const offset = renderMode === "full" ? 2 : 1;
+        standaloneViews.set(this, { projection, offset, width });
+        mouseClickHitTests.set(this, (event) => event.width === width && (
+          projection.actions.has(event.y - offset) || projection.toggleRows.has(event.y - offset) ||
+          Boolean(projection.sourceRows?.has(event.y - offset))
+        ));
+        return [...Array<string>(offset).fill(""), ...projection.lines];
+      }
+      standaloneViews.delete(this);
       const position = activityMemberPosition(group, member);
       let renderedHeight = 0;
       let nestedClickActions: Map<number, string> | undefined;
@@ -3019,8 +3156,6 @@ export default function prettyTui(pi: ExtensionAPI) {
       // Other extensions (notably FFF in override mode) can register their own
       // grep/find renderers under built-in names. Their default boxed shell is
       // not one of our self-rendering specialized tools.
-      const thirdParty = !SPECIALIZED_TOOL_NAMES.has(this.toolName) ||
-        this.toolDefinition?.renderShell !== "self";
       const cacheable = nestedTools.count(this.toolCallId) === 0 && !this.expanded && Boolean(this.result) && !this.isPartial;
       const cached = cacheable ? this[cleanChildRenderCacheKey] : undefined;
       let decoratedContent: string[];
@@ -3038,31 +3173,10 @@ export default function prettyTui(pi: ExtensionAPI) {
         decoratedContent = cached.lines;
       } else {
         let contentLines: string[];
-        if (nestedTools.count(this.toolCallId) > 0) {
-          const projection = nestedTools.render(this, childWidth, childTheme);
+        const projection = projectTool(this, childWidth, childTheme, "compact");
+        if (projection) {
           contentLines = projection.lines;
-          nestedClickActions = projection.actions;
-        } else if (thirdParty) {
-          const summaryLines = renderThirdPartyCompact(this, childWidth, childTheme);
-          if (this.expanded) {
-            const detailPrefix = "  │ ";
-            const nativeLines = originalToolRender.call(
-              this,
-              Math.max(1, childWidth - visibleWidth(detailPrefix)),
-            );
-            const nativeContentLines = nativeLines[0] === "" ? nativeLines.slice(1) : nativeLines;
-            contentLines = [
-              summaryLines[0],
-              ...nativeContentLines.map((line: string, index: number) =>
-                childTheme.fg(
-                  "dim",
-                  index === nativeContentLines.length - 1 ? "  └ " : detailPrefix,
-                ) + stripAnsiBackgrounds(line)
-              ),
-            ];
-          } else {
-            contentLines = summaryLines;
-          }
+          if (nestedTools.count(this.toolCallId) > 0) nestedClickActions = projection.actions;
         } else {
           const lines = originalToolRender.call(this, childWidth);
           if (lines.length === 0) return lines;
@@ -3102,6 +3216,11 @@ export default function prettyTui(pi: ExtensionAPI) {
       const group = member ? activityTimeline.groupForMember(member.id) : undefined;
       const isLeftClick = event.type === "click" && event.button === "left";
       if (renderMode !== "clean" || !member || !group) {
+        patchedToolRender.call(this, event.width);
+        const view = standaloneViews.get(this);
+        if (view) return handleProjectionMouse(this, view.projection, {
+          ...event, y: event.y - view.offset, height: view.projection.lines.length,
+        });
         return originalToolHandleMouse.call(this, event);
       }
       const position = activityMemberPosition(group, member);
@@ -3128,33 +3247,15 @@ export default function prettyTui(pi: ExtensionAPI) {
         return { handled: true };
       }
 
-      if (nestedTools.count(this.toolCallId) > 0 && isLeftClick) {
+      if (nestedTools.count(this.toolCallId) > 0 || isThirdPartyTool(this)) {
         const theme = cleanThemeForToolCall(this.toolCallId) ?? activityGroupTheme(group);
-        const { childWidth } = activityTreeStyle(group, member, event.width, theme);
-        const projection = nestedTools.render(this, childWidth, theme);
-        const contentY = event.y - (position.first ? summaryHeight + 1 : 0);
-        const action = projection.actions.get(contentY);
-        if (action) {
-          nestedTools.toggle(action, Boolean(this.expanded));
-          this.updateDisplay?.();
-          this.ui?.requestRender?.();
-        }
-        // The parent title is informational; only disclosure rows act on clicks.
-        // Nested results are UI projections, not native renderer rows.
-        return { handled: true };
-      }
-
-      // Self-rendering tools reserve y=0 for Pi's leading spacer. Clean mode
-      // replaces that spacer with the compact header for non-first members.
-      const thirdPartyHeaderY = position.first ? summaryHeight + 1 : 0;
-      if (
-        (!SPECIALIZED_TOOL_NAMES.has(this.toolName) || this.toolDefinition?.renderShell !== "self") &&
-        isLeftClick &&
-        event.y === thirdPartyHeaderY
-      ) {
-        originalSetExpanded.call(this, !this.expanded);
-        this.ui?.requestRender?.();
-        return { handled: true };
+        const { childWidth, prefixWidth } = activityTreeStyle(group, member, event.width, theme);
+        const projection = projectTool(this, childWidth, theme, "compact");
+        if (projection) return handleProjectionMouse(this, projection, {
+          ...event, x: Math.max(0, event.x - prefixWidth),
+          y: event.y - (position.first ? summaryHeight + 1 : 0),
+          width: childWidth, height: projection.lines.length,
+        });
       }
 
       if (!this.result && isLeftClick) {
@@ -3653,7 +3754,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     cleanCompactToolCallIds.clear();
     cleanGroupToolCallIds.clear();
     cleanToolCallGroupOwners.clear();
-    cleanToolComponents.clear();
+    toolComponents.clear();
     cleanToolThemes.clear();
     cleanToolNames.clear();
     clearToolActivityHolds();
@@ -3902,7 +4003,11 @@ export default function prettyTui(pi: ExtensionAPI) {
     finishGroup();
   };
 
-  pi.on("session_start", (_event, ctx) => restoreCleanSession(ctx));
+  pi.on("session_start", (_event, ctx) => {
+    fullThinkingHidden = false;
+    compactThinkingHidden = true;
+    restoreCleanSession(ctx);
+  });
   pi.on("session_tree", (_event, ctx) => restoreCleanSession(ctx));
   pi.on("session_before_compact", () => {
     // Pi emits this for manual, threshold, and overflow-recovery compaction.
@@ -4071,7 +4176,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     cleanRun.activeToolCallId = undefined;
     cleanRun.activeToolName = undefined;
     cleanRun.activity = "thinking";
-    if (renderMode === "clean") startWorkingElapsedTimer();
+    startWorkingElapsedTimer();
   });
   pi.on("tool_execution_start", (event) => {
     if ((event as any).parentToolCallId) {
@@ -4222,9 +4327,33 @@ export default function prettyTui(pi: ExtensionAPI) {
     });
   });
 
+  const nativeDefinitions: Record<string, any> = {
+    read: createReadToolDefinition(cwd), bash: createBashToolDefinition(cwd),
+    edit: createEditToolDefinition(cwd), write: createWriteToolDefinition(cwd),
+    grep: createGrepToolDefinition(cwd), find: createFindToolDefinition(cwd), ls: createLsToolDefinition(cwd),
+  };
+  const registerStyledTool = (definition: any) => {
+    const native = nativeDefinitions[definition.name];
+    const select = (kind: "renderCall" | "renderResult", args: any[]) => {
+      const context = args.at(-1);
+      const useNative = renderMode === "full" || renderMode === "compact" && context.expanded;
+      const namespace = useNative ? "nativeFull" : "pretty";
+      const state = context.state[namespace] ??= { state: {} };
+      const scoped = { ...context, state: state.state, lastComponent: state[kind] };
+      const renderer = useNative ? native[kind] : definition[kind];
+      const component = renderer?.(...args.slice(0, -1), scoped);
+      state[kind] = component;
+      return component;
+    };
+    pi.registerTool({ ...definition,
+      renderCall: (...args: any[]) => select("renderCall", args),
+      renderResult: (...args: any[]) => select("renderResult", args),
+    });
+  };
+
   const read = createReadTool(cwd);
   const readLabel = read.label || read.name;
-  pi.registerTool({
+  registerStyledTool({
     ...read,
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {
@@ -4253,7 +4382,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const bash = createBashTool(cwd);
   const bashLabel = bash.label || bash.name;
-  pi.registerTool({
+  registerStyledTool({
     ...bash,
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {
@@ -4304,7 +4433,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const edit = createEditTool(cwd);
   const editLabel = edit.label || edit.name;
-  pi.registerTool({
+  registerStyledTool({
     ...edit,
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {
@@ -4347,7 +4476,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const write = createWriteTool(cwd);
   const writeLabel = write.label || write.name;
-  pi.registerTool({
+  registerStyledTool({
     ...write,
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {
@@ -4379,7 +4508,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const grep = createGrepTool(cwd);
   const grepLabel = grep.label || grep.name;
-  pi.registerTool({
+  registerStyledTool({
     ...grep,
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {
@@ -4400,7 +4529,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const find = createFindTool(cwd);
   const findLabel = find.label || find.name;
-  pi.registerTool({
+  registerStyledTool({
     ...find,
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {
@@ -4419,7 +4548,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const ls = createLsTool(cwd);
   const lsLabel = ls.label || ls.name;
-  pi.registerTool({
+  registerStyledTool({
     ...ls,
     renderShell: "self",
     renderCall(args: any, theme: any, context: any) {

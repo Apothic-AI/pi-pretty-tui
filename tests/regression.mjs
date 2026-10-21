@@ -6,6 +6,7 @@ import { createJiti } from "jiti";
 import {
   AssistantMessageComponent,
   CustomMessageComponent,
+  CompactionSummaryMessageComponent,
   CustomEditor,
   InteractiveMode,
   ToolExecutionComponent,
@@ -30,9 +31,12 @@ const originalPrototypeMethods = [
   ["Markdown.render", Markdown.prototype, "render"],
   ["Markdown.renderToken", Markdown.prototype, "renderToken"],
   ["Markdown.handleMouse", Markdown.prototype, "handleMouse"],
+  ["AssistantMessageComponent.setHideThinkingBlock", AssistantMessageComponent.prototype, "setHideThinkingBlock"],
   ["AssistantMessageComponent.updateContent", AssistantMessageComponent.prototype, "updateContent"],
   ["AssistantMessageComponent.render", AssistantMessageComponent.prototype, "render"],
   ["AssistantMessageComponent.handleMouse", AssistantMessageComponent.prototype, "handleMouse"],
+  ["CompactionSummaryMessageComponent.render", CompactionSummaryMessageComponent.prototype, "render"],
+  ["CompactionSummaryMessageComponent.handleMouse", CompactionSummaryMessageComponent.prototype, "handleMouse"],
   ["CustomMessageComponent.render", CustomMessageComponent.prototype, "render"],
   ["CustomMessageComponent.handleMouse", CustomMessageComponent.prototype, "handleMouse"],
   ["ToolExecutionComponent.markExecutionStarted", ToolExecutionComponent.prototype, "markExecutionStarted"],
@@ -330,12 +334,12 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const bubbleContext = sessionContext([]);
   bubbleContext.ui.theme = {
     fg(name, text) {
-      return name === "mdLink" ? `<mdLink>${text}</mdLink>` : text;
+      return name === "mdHeading" ? `<mdHeading>${text}</mdHeading>` : text;
     },
   };
   await emit("session_start", {}, bubbleContext);
   const plainLines = (component, width) => component.render(width).map((line) =>
-    stripTerminalSequences(line).replaceAll("<mdLink>", "").replaceAll("</mdLink>", ""),
+    stripTerminalSequences(line).replaceAll("<mdHeading>", "").replaceAll("</mdHeading>", ""),
   );
   const frameBounds = (line) => {
     const start = line.indexOf("╭");
@@ -347,7 +351,7 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const shortRaw = shortBubble.render(80);
   const shortLines = plainLines(shortBubble, 80);
   const shortFrame = frameBounds(shortLines[0]);
-  assert.ok(shortRaw[0].includes("<mdLink>"), shortRaw[0]);
+  assert.ok(shortRaw[0].includes("<mdHeading>"), shortRaw[0]);
   assert.ok(!shortLines.join("\n").includes("User"), shortLines.join("\n"));
   assert.equal(shortFrame.width, 10);
   assert.equal(shortFrame.start, 69);
@@ -376,6 +380,31 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const narrowLines = plainLines(longBubble, 20);
   assert.ok(frameBounds(narrowLines[0]).start >= 1, narrowLines[0]);
   for (const line of narrowLines) assert.equal(visibleWidth(line), 20, line);
+
+  const modeContext = { hasUI: true, ui: { notify() {} } };
+  bubbleContext.ui.theme.bg = (_role, text) => "\x1b[48;5;236m" + text + "\x1b[49m";
+  await commands.get("pretty-tui").handler("full", modeContext);
+  assert.ok(shortBubble.render(80).every((line) => line.includes("\x1b[48;5;236m")), "User uses the shared panel background");
+  for (const width of [8, 20, 80]) {
+    const fullRows = plainLines(shortBubble, width);
+    assert.equal(frameBounds(fullRows[0]).start, width >= 20 ? 1 : 0);
+    assert.equal(frameBounds(fullRows[0]).width, width - (width >= 20 ? 2 : 0));
+    assert.ok(fullRows.every((line) => visibleWidth(line) === width));
+    if (width >= 9) assert.ok(fullRows[0].trimStart().startsWith("╭─ User "));
+  }
+  shortBubble.setOutputPad(5);
+  assert.equal(frameBounds(plainLines(shortBubble, 80)[0]).width, 78, "full width ignores adaptive bubble padding");
+  assert.equal(frameBounds(plainLines(shortBubble, 80)[0]).start, 1);
+  const fullLongRows = plainLines(longBubble, 80);
+  assert.equal(frameBounds(fullLongRows[0]).width, 78);
+  assert.ok(fullLongRows.length < longLines.length, "full uses the extra width for body text");
+  for (const mode of ["compact", "clean"]) {
+    await commands.get("pretty-tui").handler(mode, modeContext);
+    const adaptive = plainLines(shortBubble, 80);
+    assert.equal(frameBounds(adaptive[0]).width, mode === "compact" ? 78 : 10);
+    assert.ok(frameBounds(adaptive[0]).start > 0);
+    assert.equal(adaptive[0].includes("User"), mode === "compact");
+  }
 }
 
 // The transcript-first model keeps thinking, tools, and updates in order
@@ -1221,6 +1250,12 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     const border = (width = 80) => CustomEditor.prototype.renderTopBorder.call(editor, width, 0);
     assert.ok(stripTerminalSequences(border()).includes("Working 0s"));
     now += 83_000;
+    const modeContext = { hasUI: true, ui: { notify() {} } };
+    for (const mode of ["compact", "full", "clean"]) {
+      await commands.get("pretty-tui").handler(mode, modeContext);
+      assert.ok(stripTerminalSequences(border()).includes("Working 1m 23s"), mode);
+      assert.ok(!stripTerminalSequences(border(17)).includes("1m 23s"), mode);
+    }
     assert.ok(stripTerminalSequences(border()).includes("Working 1m 23s"));
     assert.match(border(), /\x1b\[34m 1m 23s\x1b\[39m/);
     assert.equal(indicator.renderInBorder, originalIndicatorRender, "indicator must not remain patched");
@@ -1684,7 +1719,7 @@ for (const name of ["find", "grep"]) {
   assert.equal(children.length, 3, "UI folding must not remove original components");
   const commandContext = { hasUI: true, ui: { notify() {} } };
   await commands.get("pretty-tui").handler("full", commandContext);
-  assert.ok(restored.every((component) => component.render(100).length > 0));
+  assert.equal(plain().split("fetch failed").length - 1, 3);
   await commands.get("pretty-tui").handler("clean", commandContext);
   assert.match(plain(), /fetch failed ×3/);
 }
@@ -2046,6 +2081,88 @@ for (const name of ["find", "grep"]) {
   assert.notEqual(warningColor, errorColor);
 }
 
+// Shared thoughts and notifications keep their content through mode switches.
+{
+  const commandContext = { hasUI: true, ui: { notify() {} } };
+  const render = (component, width = 100) => component.render(width).map(stripTerminalSequences);
+  for (const mode of ["clean", "compact", "full"]) {
+    await commands.get("pretty-tui").handler(mode, commandContext);
+    await emit("session_start", {}, sessionContext([]));
+    await emit("agent_start");
+    const message = { role: "assistant", timestamp: `shared-thought-${mode}`, content: [{ type: "text", text: "VISIBLE_ANSWER" }] };
+    await emit("message_update", { message });
+    const component = new AssistantMessageComponent(message);
+    const complete = { ...message, content: [
+      { type: "thinking", thinking: "SHARED_THOUGHT_PREVIEW\nSHARED_THOUGHT_DETAIL\n\n- 思考详情" }, ...message.content,
+    ] };
+    await emit("message_update", { message: complete });
+    component.updateContent(complete, false);
+    let rows = render(component);
+    if (mode === "clean") {
+      component.handleMouse({ type: "click", button: "left", x: 4, y: 1, width: 100, height: rows.length });
+      rows = render(component);
+    }
+    assert.ok(rows.join("\n").includes(mode !== "clean" ? "╭─ thought" : "● thought"), mode);
+    assert.ok(rows.join("\n").includes("VISIBLE_ANSWER"));
+    assert.equal(rows.join("\n").includes("SHARED_THOUGHT_DETAIL"), mode === "full");
+    const y = rows.findIndex((line) => line.includes(mode !== "clean" ? "╭─ thought" : "● thought"));
+    mouseGestureFixture(component, rows, 100).gesture(6, y, [[2, 0]]);
+    assert.equal(render(component).join("\n").includes("SHARED_THOUGHT_DETAIL"), mode !== "full");
+    assert.equal(render(component).filter((line) => line.includes("VISIBLE_ANSWER")).length, 1);
+    if (mode !== "clean") {
+      component.setHideThinkingBlock(true);
+      assert.ok(!render(component).join("\n").includes("SHARED_THOUGHT_DETAIL"));
+      component.setHideThinkingBlock(false);
+      assert.ok(render(component).join("\n").includes("SHARED_THOUGHT_DETAIL"));
+      for (const width of (mode === "full" ? [12, 40] : [1, 12, 40])) assert.ok(render(component, width).every((line) => visibleWidth(line) <= width));
+    }
+    const host = { ui: { requestRender() {} }, chatContainer: { children: [], addChild(child) { this.children.push(child); } } };
+    InteractiveMode.prototype.showStatus.call(host, "Shared UI status");
+    const statusText = () => mode === "full" ? host.chatContainer.children.flatMap((child) => render(child)).join("\n") : widgetText();
+    assert.ok(statusText().includes("Shared UI status"));
+    for (const target of ["full", "compact", "clean", mode]) {
+      await commands.get("pretty-tui").handler(target, commandContext);
+      assert.ok(statusText().includes("Shared UI status"), "switching modes must not clear feedback");
+      const switched = render(component).join("\n");
+      assert.equal(switched.split("VISIBLE_ANSWER").length - 1, 1, target);
+      if (target !== "clean") assert.ok(switched.includes(target !== "clean" ? "╭─ thought" : "● thought"), target);
+    }
+    for (const severity of ["info", "warning", "error", "error"]) {
+      InteractiveMode.prototype.showExtensionNotify.call(host, severity === "error" ? "Error\nSHARED_ERROR" : `${severity} notice\nSHARED_NOTICE_DETAIL`, severity);
+    }
+    const all = () => host.chatContainer.children.flatMap((child) => render(child)).join("\n");
+    assert.match(all(), mode === "full" ? /info notice/ : /◇ info notice/);
+    assert.match(all(), mode === "full" ? /Warning: warning notice/ : /⚠ warning notice/);
+    if (mode === "full") assert.equal(all().split("SHARED_ERROR").length - 1, 2);
+    else assert.match(all(), /✕ Error · SHARED_ERROR ×2/);
+    assert.ok(all().includes("SHARED_NOTICE_DETAIL"));
+    assert.ok(!widgetText().includes("SHARED_ERROR"));
+    for (const target of ["compact", "full", "clean"]) {
+      await commands.get("pretty-tui").handler(target, commandContext);
+      if (target === "full" || mode === "full") assert.equal(all().split("SHARED_ERROR").length - 1, 2);
+      else assert.match(all(), /SHARED_ERROR ×2/);
+    }
+    await commands.get("pretty-tui").handler(mode, commandContext);
+    const custom = new CustomMessageComponent({ role: "custom", customType: "shared-update", content: "CUSTOM_SHARED_DETAIL", display: true, timestamp: `${mode}-custom` });
+    assert.match(render(custom).join("\n"), /CUSTOM_SHARED_DETAIL/);
+    // A partial answer and its terminal failure are both retained exactly once.
+    const failed = new AssistantMessageComponent({ role: "assistant", timestamp: `${mode}-failed`, stopReason: "error", errorMessage: "SHARED_TERMINAL_ERROR", content: [{ type: "text", text: "PARTIAL_SHARED_ANSWER" }] });
+    const failureRows = render(failed).join("\n");
+    assert.equal(failureRows.split("SHARED_TERMINAL_ERROR").length - 1, 1);
+    assert.ok(failureRows.includes("PARTIAL_SHARED_ANSWER"));
+    for (const stopReason of ["aborted", "length"]) {
+      const stopped = new AssistantMessageComponent({ role: "assistant", timestamp: `${mode}-${stopReason}`, stopReason,
+        errorMessage: `SHARED_${stopReason}`, content: [{ type: "text", text: "STOPPED_ANSWER" }] });
+      const stoppedRows = render(stopped).join("\n");
+      assert.ok(mode === "full" ? stoppedRows.includes(stopReason === "aborted" ? "SHARED_aborted" : "Response was truncated") : stoppedRows.includes(stopReason === "aborted" ? "⚠ Operation aborted" : "✕ Response truncated"));
+      assert.equal(stoppedRows.split(`SHARED_${stopReason}`).length - 1, mode === "full" && stopReason === "length" ? 0 : 1);
+      assert.ok(stoppedRows.includes("STOPPED_ANSWER"));
+    }
+    await emit("agent_settled");
+  }
+  await commands.get("pretty-tui").handler("clean", commandContext);
+}
+
 // Only the Running parent dot pulses; its label and settled dot stay stable.
 {
   const pulseColors = [];
@@ -2370,6 +2487,15 @@ for (const name of ["find", "grep"]) {
   bubble.setOutputPad(3);
   assert.equal(click(rows()[0].indexOf("╭"), 0)?.handled, true);
   assert.equal(copies.at(-1), raw, "rebuild must preserve bubble copy");
+  const userModeContext = { hasUI: true, ui: { notify() {} } };
+  for (const mode of ["full", "compact"]) {
+    await commands.get("pretty-tui").handler(mode, userModeContext);
+    assert.ok(rows()[0].trimStart().startsWith("╭─ User "));
+    assert.equal(rows()[0].indexOf("╮"), 98);
+    assert.equal(click(1, 0)?.handled, true);
+    assert.equal(copies.at(-1), raw, "User title and full-width border must not enter copied text");
+  }
+  await commands.get("pretty-tui").handler("clean", userModeContext);
   // Bubble press falls through to Pi's selection-based click pipeline.
   const jitterX = rows()[0].indexOf("╭") + 2;
   const jitterY = rows().findIndex((line) => line.includes("hello"));
@@ -2681,6 +2807,22 @@ for (const name of ["find", "grep"]) {
   } catch {}
   const regular = transcriptMarkdownFixture("```sh\necho regular\n```").render(30);
   assert.ok(regular.every((line) => !line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").includes("[Copy]")));
+  try { InteractiveMode.prototype.renderSessionEntries.call({ ui: fullscreenUi }, []); } catch {}
+  const fullCommandContext = { hasUI: true, ui: { notify() {} } };
+  await commands.get("pretty-tui").handler("full", fullCommandContext);
+  const replyCard = transcriptMarkdownFixture("```sh\necho framed answer\n```");
+  const replyCardRows = replyCard.render(48).map(stripControls);
+  assert.ok(replyCardRows[0].includes("╭─ Assistant"));
+  const cardCopyY = replyCardRows.findIndex((line) => line.includes("[Copy]"));
+  assert.ok(cardCopyY > 0);
+  const cardCopyX = replyCardRows[cardCopyY].indexOf("[Copy]") + 1;
+  const cardClick = { button: "left", x: cardCopyX, y: cardCopyY, width: 48, height: replyCardRows.length };
+  assert.equal(replyCard.handleMouse({ ...cardClick, type: "press" })?.handled, true);
+  assert.equal(replyCard.handleMouse({ ...cardClick, type: "click" })?.handled, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(nativeCopies.at(-1), "echo framed answer", "Assistant borders and title must not enter copied code");
+  await commands.get("pretty-tui").handler("clean", fullCommandContext);
+  try { InteractiveMode.prototype.renderSessionEntries.call({ ui: { mode: "regular" } }, []); } catch {}
 }
 
 // Clean summary rows tolerate a two-cell horizontal wobble while ordinary
@@ -2932,6 +3074,644 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
   assert.match(nested.render({ toolCallId: "wrapper", toolName: "other-wrapper", args: {}, result: {} }, 80, theme).lines.join("\n"), /mcp.tool/);
 }
 
+// Repaints reuse wrapped nested details, but every visible change invalidates
+// the owning tree. Unrelated live tools must not evict completed history.
+{
+  const { NestedTools } = await import("../extensions/nested-tools.ts");
+  const nested = new NestedTools();
+  const start = (root) => nested.start({ toolCallId: `${root}/1`, parentToolCallId: root, toolName: "read", args: { path: "cached.ts" } });
+  const update = (root, text) => nested.update({ toolCallId: `${root}/1`, result: { content: [{ type: "text", text }] } }, true);
+  start("cached"); update("cached", "First line\nCACHED_DETAIL");
+  const owner = { toolCallId: "cached", toolName: "codemode", expanded: true, args: {}, result: { content: [] } };
+  let color = "dark";
+  const cacheTheme = { bold: (s) => s, fg: (role, s) => `<${color}:${role}>${s}` };
+  const render = (width = 100, rootDetails = false) => nested.render(owner, width, cacheTheme, { rootDetails });
+  const first = render();
+  assert.equal(render(), first, "unchanged repaint reuses rows and hit regions");
+  start("other"); update("other", "UNRELATED_UPDATE");
+  assert.equal(render(), first, "another active root must not evict this cached history");
+  nested.toggle("cached/1", true);
+  assert.ok(!render().lines.join("\n").includes("CACHED_DETAIL"));
+  nested.clearExpansion();
+  assert.ok(render().lines.join("\n").includes("CACHED_DETAIL"));
+  update("cached", "Changed line\nUPDATED_DETAIL");
+  assert.ok(render().lines.join("\n").includes("UPDATED_DETAIL"));
+  assert.ok(!render().lines.join("\n").includes("CACHED_DETAIL"));
+  const beforeTheme = render(); color = "light";
+  assert.notEqual(render(), beforeTheme, "in-place theme changes must refresh cached colors");
+  assert.ok(render().lines.some((line) => line.includes("<light:")));
+  assert.notEqual(render(40), render(100));
+  assert.notEqual(render(100, true), render(100, false));
+  owner.expanded = false;
+  assert.ok(!render().lines.join("\n").includes("UPDATED_DETAIL"));
+  const { ThoughtPresentation } = await import("../extensions/thought-presentation.ts");
+  const thought = new ThoughtPresentation();
+  const thoughtOwner = { markdownTheme: getMarkdownTheme() };
+  const details = thought.details(thoughtOwner, "LONG_THOUGHT_DETAIL", cacheTheme, 80);
+  assert.equal(thought.details(thoughtOwner, "LONG_THOUGHT_DETAIL", cacheTheme, 80), details);
+  color = "changed";
+  assert.notEqual(thought.details(thoughtOwner, "LONG_THOUGHT_DETAIL", cacheTheme, 80), details);
+  assert.ok(thought.details(thoughtOwner, "NEW_THOUGHT_DETAIL", cacheTheme, 80).join("\n").includes("NEW_THOUGHT_DETAIL"));
+}
+
+// Card surfaces retain outline hues, stay readable, and follow theme changes
+// without recomputing color conversion on every row or repaint.
+{
+  const { cardSurface } = await jiti.import(join(process.cwd(), "extensions/card-surface.ts"));
+  const { frameNativeRows } = await jiti.import(join(process.cwd(), "extensions/full-frame.ts"));
+  const { oklchColor, colorToRgb, colorToOklch, backgroundAnsi } = await import("@earendil-works/pi-tui");
+  const styles = [];
+  let mode = "truecolor";
+  const surfaceTheme = {
+    appearance: "dark",
+    colors: {
+      mdLink: oklchColor(0.72, 0.15, 250), mdHeading: oklchColor(0.8, 0.12, 80), accent: oklchColor(0.75, 0.17, 295),
+      success: oklchColor(0.78, 0.16, 145), error: oklchColor(0.68, 0.18, 25),
+      text: oklchColor(0.95, 0, 0),
+    },
+    getColorMode: () => mode, fg: (_role, text) => text, bold: (text) => text,
+    style(text, { bg }) { styles.push(bg); return backgroundAnsi(bg, mode) + text + "\x1b[49m"; },
+  };
+  const luminance = (color) => {
+    const rgb = colorToRgb(color);
+    const linear = (value) => { const n = value / 255; return n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4; };
+    return 0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b);
+  };
+  const contrast = (a, b) => (Math.max(luminance(a), luminance(b)) + 0.05) / (Math.min(luminance(a), luminance(b)) + 0.05);
+  const swatches = new Set();
+  for (const role of ["mdLink", "mdHeading", "accent", "success", "error", "text"]) {
+    const surface = cardSurface(surfaceTheme, role);
+    const fill = styles.at(-1);
+    const outline = colorToOklch(surfaceTheme.colors[role]);
+    assert.ok(fill.l < outline.l && fill.c <= outline.c, role);
+    assert.ok(Math.abs(fill.h - outline.h) < 0.001, `${role}: keep outline hue`);
+    assert.ok(contrast(fill, surfaceTheme.colors.text) >= 4.5, `${role}: dark-theme text contrast`);
+    swatches.add(surface.prefix);
+    const calls = styles.length;
+    assert.equal(cardSurface(surfaceTheme, role), surface);
+    assert.equal(styles.length, calls, "unchanged surfaces reuse color conversion");
+  }
+  assert.equal(swatches.size, 6);
+  const owner = {};
+  const first = frameNativeRows("thought", ["text"], 80, surfaceTheme, undefined, owner, "mdLink", "", "mdLink");
+  surfaceTheme.colors.mdLink = oklchColor(0.7, 0.16, 205);
+  const changed = frameNativeRows("thought", ["text"], 80, surfaceTheme, undefined, owner, "mdLink", "", "mdLink");
+  assert.notEqual(changed, first, "in-place theme color updates invalidate panel caches");
+  assert.notEqual(changed.lines[0], first.lines[0]);
+  surfaceTheme.appearance = "light";
+  for (const role of ["mdLink", "mdHeading", "accent", "success", "error", "text"]) {
+    cardSurface(surfaceTheme, role);
+    assert.ok(contrast(styles.at(-1), oklchColor(0.18, 0, 0)) >= 4.5, `${role}: light-theme text contrast`);
+  }
+  mode = "256color";
+  assert.ok(cardSurface(surfaceTheme, "mdLink").prefix.includes("\x1b[48;5;"));
+}
+
+// Full panels share a themed surface and retain native content/coordinates.
+// Tool call and output occupy one frame, not separate nested cards.
+{
+  const { renderToolProjection } = await jiti.import(join(process.cwd(), "extensions/tool-presentation.ts"));
+  const { NestedTools } = await import("../extensions/nested-tools.ts");
+  const { frameNativeRows, frameNativeToolRows, cardBackground } = await jiti.import(join(process.cwd(), "extensions/full-frame.ts"));
+  const { stripAnsiBackgrounds } = await jiti.import(join(process.cwd(), "extensions/ansi-style.ts"));
+  const nested = new NestedTools();
+  nested.start({ toolCallId: "media/1", parentToolCallId: "media", toolName: "read", args: {} });
+  const image = "\x1b_Ga=T,f=100;IMAGE_PROTOCOL_PAYLOAD\x1b\\";
+  const nativeLines = ["", "\x1b[44mNATIVE MEDIA TITLE\x1b[49m", image];
+  const projection = renderToolProjection({ toolCallId: "media", toolName: "codemode", args: { code: "ROOT_SCRIPT" } }, 40, theme, {
+    mode: "full", nested, nestedExpanded: true, renderNative: () => nativeLines,
+  });
+  assert.ok(projection.lines.includes(image));
+  assert.equal(projection.native.height, nativeLines.length);
+  assert.equal(projection.actions.size, 0, "full must not add snapshot-only child disclosures");
+  const compactImage = renderToolProjection({ toolCallId: "compact-media", toolName: "media", expanded: true,
+    args: {}, result: { content: [], isError: false } }, 40, theme, {
+    mode: "compact", nested, nestedExpanded: true, renderNative: () => nativeLines,
+  });
+  assert.ok(compactImage.lines.includes(image), "expanded compact panels preserve native image protocol verbatim");
+  const owner = {};
+  let appearance = "dark";
+  const bg = (role) => `\x1b[48;5;${role === "toolErrorBg" ? 52 : appearance === "light" ? 250 : 236}m`;
+  const panelTheme = { bold: (text) => text, fg: (_role, text) => text,
+    bg: (role, text) => bg(role) + text + "\x1b[49m" };
+  const panel = frameNativeRows("Assistant", ["ORIGINAL_ROW\x1b[0m TEXT"], 80, panelTheme, undefined, owner);
+  assert.ok(panel.lines.every((line) => line.trimStart().startsWith(bg("toolPendingBg"))));
+  assert.ok(panel.lines.every((line) => line.startsWith(" ") && line.endsWith(" ")), "outer gutters have terminal background, outside the panel fill");
+  assert.ok(panel.lines.every((line) => visibleWidth(line) === 80));
+  assert.equal(panel.inset, 3, "mouse offsets include margin and frame padding");
+  assert.ok(panel.lines.some((line) => line.includes("\x1b[0m" + bg("toolPendingBg") + " TEXT")), "reset restores panel fill");
+  assert.equal(frameNativeRows("Assistant", ["ORIGINAL_ROW\x1b[0m TEXT"], 80, panelTheme, undefined, owner), panel);
+  appearance = "light";
+  assert.notEqual(frameNativeRows("Assistant", ["ORIGINAL_ROW\x1b[0m TEXT"], 80, panelTheme, undefined, owner), panel);
+  const source = ["CALL_ARGUMENTS", "RESULT_TEXT", image];
+  const toolOwner = {};
+  const combined = frameNativeToolRows("read", source, 40, panelTheme, 1, "success", toolOwner);
+  const plain = combined.lines.map(stripTerminalSequences);
+  assert.equal(plain.filter((line) => line.trimStart().startsWith("╭─")).length, 1);
+  assert.equal(plain.filter((line) => line.trimStart().startsWith("╰")).length, 1);
+  assert.ok(plain.some((line) => line.trimStart().startsWith("├─ Output")));
+  assert.ok(!plain.includes("  │"));
+  assert.deepEqual([...new Set(combined.sourceRows.values())], [0, 1, 2]);
+  for (const [y, sourceY] of combined.sourceRows) {
+    if (!plain[y].trimStart().startsWith("├─")) assert.ok(combined.lines[y].includes(source[sourceY]));
+  }
+  assert.ok(combined.lines.includes(image), "image payload and cursor placement remain verbatim");
+  assert.equal(frameNativeToolRows("read", source, 40, panelTheme, 1, "success", toolOwner).lines, combined.lines);
+  const failed = frameNativeToolRows("bash", ["command", "error detail"], 40, panelTheme, 1, "error", {}, "Took 1.2s");
+  assert.ok(failed.lines.every((line) => line.trimStart().startsWith(bg("toolErrorBg"))));
+  assert.ok(stripTerminalSequences(failed.lines.at(-1)).includes("Took 1.2s"));
+  const pending = frameNativeToolRows("read", ["CALL_ONLY"], 40, panelTheme, undefined, {}, "");
+  assert.ok(!pending.lines.map(stripTerminalSequences).some((line) => line.includes("Output")));
+  const padded = ["", "arg A", "", "arg B", "", "", "out A", "", "out B", ""];
+  const tight = frameNativeToolRows("edit", padded, 60, theme, 5, "success", {});
+  assert.deepEqual([...new Set(tight.sourceRows.values())], [1, 2, 3, 6, 7, 8]);
+  assert.ok(tight.lines.every((line) => visibleWidth(line) <= 60));
+  const narrow = frameNativeToolRows("edit", ["call", "result"], 12, panelTheme, 1, "success", {});
+  assert.ok(narrow.lines.every((line) => visibleWidth(line) <= 12));
+  const tiny = frameNativeRows("tool", nativeLines, 5, panelTheme);
+  assert.ok(tiny.lines.includes(image));
+  // Background removal preserves foreground colors even when RGB channels
+  // equal SGR background opcodes, and the panel fill survives embedded resets.
+  assert.equal(stripAnsiBackgrounds("\x1b[1;38;2;40;49;100;48;2;1;2;3mX"), "\x1b[1;38;2;40;49;100mX");
+  assert.equal(stripAnsiBackgrounds("\x1b[48:2::1:2:3;38:2::40:49:100mX"), "\x1b[38:2::40:49:100mX");
+  const foreground = cardBackground("\x1b[38;2;0;0;0mX", 20, panelTheme);
+  assert.ok(foreground.includes("\x1b[38;2;0;0;0mX"));
+  assert.equal(foreground.split(bg("toolPendingBg")).length - 1, 1, "RGB zeros are not resets");
+}
+
+// Standalone compact projections share nested data and local actions,
+// without borrowing clean's group ownership, coordinates, or collapse rows.
+{
+  const ctx = { hasUI: true, ui: { notify() {} } };
+  const render = (tool, width = 100) => tool.render(width).map(stripTerminalSequences);
+  const click = (tool, needle, dx = 0) => {
+    const rows = render(tool);
+    const y = rows.findIndex((line) => line.includes(needle));
+    assert.ok(y >= 0, rows.join("\n"));
+    if (dx) mouseGestureFixture(tool, rows, 100).gesture(12, y, [[dx, 0]]);
+    else tool.handleMouse({ type: "click", button: "left", x: 12, y, width: 100, height: rows.length });
+  };
+  const nativeDefinition = {
+    renderShell: "self", label: "Wrapper Label",
+    renderCall: () => new Text("\x1b[44mNATIVE ROOT SCRIPT\x1b[49m", 0, 0),
+    renderResult: (r) => new Text(r.content.map((c) => c.text ?? "").join("\n"), 0, 0),
+  };
+  for (const mode of ["compact"]) {
+    await commands.get("pretty-tui").handler(mode, ctx);
+    await emit("session_start", {}, sessionContext([]));
+    await emit("agent_start");
+    const id = `standalone-${mode}`;
+    let redraws = 0;
+    const root = new ToolExecutionComponent("custom-wrapper", id, { code: "SHARED_SCRIPT_BODY" }, undefined,
+      nativeDefinition, { requestRender() { redraws++; } }, process.cwd());
+    root.markExecutionStarted(); root.render(100);
+    for (const [child, name] of [["1", "read"], ["2", "remote"]]) {
+      await emit("tool_execution_start", { toolCallId: `${id}/${child}`, parentToolCallId: id, toolName: name, args: { path: "fixture.txt" } });
+    }
+    assert.ok(redraws > 1, "nested updates request the owning component's UI in every mode");
+    let rows = render(root);
+    assert.ok(rows.some((line) => line.includes("read(")));
+    assert.ok(rows.some((line) => line.includes("remote(")));
+    assert.ok(!rows.some((line) => /(?:Running|Done)\(\d+ tool calls/.test(line)));
+    assert.ok(!rows.join("\n").includes("[↑ Collapse]"));
+    // Finish out of order; rows must remain in launch order and errors visible.
+    for (const child of ["2", "1"]) {
+      await emit("tool_execution_end", { toolCallId: `${id}/${child}`, parentToolCallId: id,
+        toolName: child === "1" ? "read" : "remote", isError: child === "2",
+        result: { content: [{ type: "text", text: child === "1" ? "Read fixture\nSHARED_CHILD_DETAIL" : "Permission denied\nSHARED_ERROR_DETAIL" }] } });
+    }
+    const rootResult = { content: [{ type: "text", text: "SHARED_PARENT_OUTPUT" }], isError: false };
+    await emit("tool_execution_end", { toolCallId: id, toolName: "custom-wrapper", result: rootResult, isError: false });
+    root.updateResult(rootResult);
+    rows = render(root);
+    assert.ok(rows.findIndex((line) => line.includes("read(")) < rows.findIndex((line) => line.includes("remote(")));
+    assert.ok(rows.join("\n").includes("Permission denied"));
+    assert.equal(rows.join("\n").includes("SHARED_CHILD_DETAIL"), false);
+    click(root, "read(", 2);
+    assert.equal(render(root).join("\n").includes("SHARED_CHILD_DETAIL"), true);
+    assert.equal(render(root).join("\n").includes("SHARED_ERROR_DETAIL"), false, "local disclosure does not toggle its sibling");
+    const host = { ui: { requestRender() {} }, chatContainer: { children: [root] },
+      loadedResourcesContainer: { children: [] }, toolOutputExpanded: false, showStatus() {},
+      setToolsExpanded: InteractiveMode.prototype.setToolsExpanded };
+    InteractiveMode.prototype.setToolsExpanded.call(host, true);
+    assert.ok(render(root).join("\n").includes("SHARED_CHILD_DETAIL"));
+    assert.ok(render(root).join("\n").includes("SHARED_ERROR_DETAIL"));
+    click(root, "SHARED_CHILD_DETAIL");
+    assert.ok(!render(root).join("\n").includes("SHARED_CHILD_DETAIL"));
+    assert.ok(render(root).join("\n").includes("SHARED_ERROR_DETAIL"));
+    InteractiveMode.prototype.setToolsExpanded.call(host, false);
+    assert.ok(!render(root).join("\n").includes("SHARED_ERROR_DETAIL"));
+    InteractiveMode.prototype.toggleToolOutputExpansion.call(host);
+    assert.ok(render(root).join("\n").includes("SHARED_CHILD_DETAIL"), "native Ctrl+O route resets local overrides");
+
+    assert.ok(render(root).join("\n").includes("SHARED_SCRIPT_BODY"));
+    assert.ok(render(root).join("\n").includes("SHARED_PARENT_OUTPUT"));
+    click(root, "SHARED_SCRIPT_BODY");
+    assert.ok(!render(root).join("\n").includes("SHARED_SCRIPT_BODY"));
+    click(root, "SHARED_PARENT_OUTPUT");
+    assert.ok(!render(root).join("\n").includes("SHARED_PARENT_OUTPUT"));
+    for (const width of [1, 12, 40]) assert.ok(render(root, width).every((line) => visibleWidth(line) <= width));
+
+    // A mode change must not retain standalone hit regions or insert a
+    // phantom activity row when clean takes ownership of the same component.
+    await commands.get("pretty-tui").handler("clean", ctx);
+    const cleanRows = render(root);
+    assert.ok(cleanRows.some((line) => /(?:Running|Done)\(/.test(line)));
+    await commands.get("pretty-tui").handler(mode, ctx);
+    assert.ok(!render(root).some((line) => /(?:Running|Done)\(\d+ tool calls/.test(line)));
+    const saved = appendedEntries.findLast((entry) => entry.type === "pretty-tui-nested-results" && entry.data.rootId === id);
+    assert.ok(saved);
+    await emit("session_start", {}, sessionContext([
+      assistant("90", undefined, [{ id, name: "custom-wrapper" }]),
+      { type: "custom", customType: saved.type, data: saved.data },
+    ]));
+    const restored = new ToolExecutionComponent("custom-wrapper", id, {}, undefined, nativeDefinition, { requestRender() {} }, process.cwd());
+    restored.updateResult(rootResult);
+    assert.ok(render(restored).join("\n").includes("Permission denied"));
+    click(restored, "read(");
+    assert.ok(render(restored).join("\n").includes("SHARED_CHILD_DETAIL"));
+
+    // A third-party replacement under a built-in name is not specialized.
+    const third = new ToolExecutionComponent("grep", `${id}-third`, { path: "source.ts" }, undefined,
+      { label: "Custom Search", renderCall: () => new Text("THIRD_NATIVE_DETAIL", 0, 0) }, { requestRender() {} }, process.cwd());
+    third.updateResult({ content: [{ type: "text", text: "Third result\nTHIRD_RESULT_DETAIL" }], isError: true });
+    const thirdRows = render(third);
+
+    assert.ok(thirdRows.join("\n").includes("Custom Search"));
+    assert.ok(thirdRows.join("\n").includes("path=source.ts"));
+    assert.ok(!thirdRows.join("\n").includes("THIRD_NATIVE_DETAIL"));
+    click(third, "Custom Search", -2);
+    assert.ok(render(third).join("\n").includes("THIRD_NATIVE_DETAIL"));
+    for (const width of [1, 12, 40]) assert.ok(render(third, width).every((line) => visibleWidth(line) <= width));
+    click(third, "Custom Search");
+    assert.ok(!render(third).join("\n").includes("THIRD_NATIVE_DETAIL"));
+
+    let nativeMouse;
+    const interactive = new ToolExecutionComponent("interactive-tool", `${id}-interactive`, {}, undefined,
+      { renderShell: "self", renderCall: () => ({
+        render: () => ["NATIVE_BUTTON"], invalidate() {},
+        handleMouse(event) { nativeMouse = event; return { handled: true }; },
+      }) }, { requestRender() {} }, process.cwd());
+    interactive.setExpanded(true);
+    const interactiveRows = render(interactive);
+    const nativeY = interactiveRows.findIndex((line) => line.includes("NATIVE_BUTTON"));
+    assert.ok(nativeY >= 0);
+    interactive.handleMouse({ type: "click", button: "left", x: 12, y: nativeY, width: 100, height: interactiveRows.length });
+    assert.equal(nativeMouse?.y, 0, "native interaction keeps its own local row coordinates");
+    assert.equal(nativeMouse?.x, mode === "compact" ? 9 : 5);
+    assert.equal(nativeMouse?.width, mode === "compact" ? 94 : 90);
+    await emit("session_start", {}, sessionContext([]));
+    await emit("tool_execution_start", { toolCallId: `${id}/cancel`, parentToolCallId: id, toolName: "wait", args: {} });
+    await emit("agent_settled");
+    const cancelled = new ToolExecutionComponent("custom-wrapper", id, {}, undefined, nativeDefinition, { requestRender() {} }, process.cwd());
+    assert.match(render(cancelled).join("\n"), /⊘ wait/);
+  }
+  await commands.get("pretty-tui").handler("clean", ctx);
+}
+
+// Compaction cards preserve the native token notice, summary and expansion API.
+{
+  const ctx = { hasUI: true, ui: { notify() {} } };
+  const message = { role: "compactionSummary", tokensBefore: 485574,
+    summary: "COMPACTION_DETAIL\n\n- Preserve this summary", timestamp: 0 };
+  const component = new CompactionSummaryMessageComponent(message);
+  const render = (width = 80) => component.render(width).map(stripTerminalSequences);
+  for (const mode of ["compact", "full"]) {
+    await commands.get("pretty-tui").handler(mode, ctx);
+    component.setExpanded(false);
+    let rows = render();
+    assert.ok(rows[0].includes("compaction ▸"));
+    assert.ok(rows.join("\n").includes("485,574"));
+    assert.ok(rows.join("\n").includes("to expand"));
+    assert.ok(!rows.join("\n").includes("COMPACTION_DETAIL"));
+    assert.ok(!rows.join("\n").includes("[compaction]"));
+    assert.equal(component.handleMouse({ type: "click", button: "left", x: 5, y: 0, width: 80, height: rows.length })?.handled, true);
+    rows = render();
+    assert.ok(rows[0].includes("compaction ▾"));
+    assert.ok(rows.join("\n").includes("COMPACTION_DETAIL"));
+    assert.ok(rows.join("\n").includes("485,574"));
+    const y = rows.findIndex((line) => line.includes("COMPACTION_DETAIL"));
+    component.handleMouse({ type: "click", button: "left", x: 6, y, width: 80, height: rows.length });
+    assert.equal(component.expanded, false);
+    component.setExpanded(true);
+    for (const width of [1, 8, 12, 40, 80]) assert.ok(render(width).every((line) => visibleWidth(line) <= width));
+    component.setExpanded(false);
+    assert.ok(!render().join("\n").includes("COMPACTION_DETAIL"));
+  }
+  await commands.get("pretty-tui").handler("clean", ctx);
+  assert.ok(render().join("\n").includes("[compaction]"));
+  assert.equal(component.message, message, "card presentation does not mutate compaction data");
+}
+
+// Compact panels keep summaries small and expose details via local/global
+// expansion without adopting clean's activity-group wrapper.
+{
+  const ctx = { hasUI: true, ui: { notify() {} } };
+  await commands.get("pretty-tui").handler("compact", ctx);
+  await emit("session_start", {}, sessionContext([]));
+  const definitions = [
+    ["read", { path: "sample.ts" }, "FIRST_LINE\nPRIVATE_READ_DETAIL", {}],
+    ["bash", { command: "npm test" }, "FIRST_LINE\nPRIVATE_BASH_DETAIL", {}],
+    ["write", { path: "sample.ts", content: "PRIVATE_WRITE_DETAIL" }, "Written", {}],
+    ["edit", { path: "sample.ts", edits: [{ oldText: "before", newText: "after" }] }, "Updated", { diff: "-1 before\n+1 PRIVATE_EDIT_DETAIL" }],
+  ];
+  const components = [];
+  const render = (tool, width = 100) => tool.render(width).map(stripTerminalSequences);
+  for (const [name, args, output, details] of definitions) {
+    const tool = new ToolExecutionComponent(name, `compact-panel-${name}`, args, undefined, tools.get(name), { requestRender() {} }, process.cwd());
+    tool.updateResult({ content: [{ type: "text", text: output }], details, isError: false, durationMs: 1200 });
+    components.push(tool);
+    const collapsed = render(tool);
+    assert.ok(collapsed.some((line) => line.trimStart().startsWith(`╭─ ${name}`)));
+    assert.ok(collapsed.some((line) => line.includes(`${name} ▸`)), "collapsed title indicates expansion");
+    assert.ok(collapsed.length <= 6, `${name}: default panel stays concise`);
+    assert.ok(!collapsed.join("\n").includes("PRIVATE_"));
+    assert.ok(!collapsed.join("\n").includes(`${name}(`), "panel title replaces the repeated tool name in the summary");
+    assert.ok(collapsed.at(-1).includes("Took 1.2s"));
+    const y = collapsed.findIndex((line) => line.includes(`╭─ ${name}`));
+    tool.handleMouse({ type: "click", button: "left", x: 6, y, width: 100, height: collapsed.length });
+    assert.equal(tool.expanded, true);
+    assert.ok(render(tool).join("\n").includes("PRIVATE_"));
+    if (name !== "write") assert.ok(render(tool).some((line) => line.includes("├─ Output")), name);
+    assert.ok(render(tool).some((line) => line.includes(`${name} ▾`)), "expanded title indicates collapse");
+    const compactDetails = render(tool).slice(1);
+    // The disclosure belongs to compact; all detail rows still match full.
+    compactDetails[0] = compactDetails[0].replace(" ▾", "").replace(/─╮/, "───╮");
+    await commands.get("pretty-tui").handler("full", ctx);
+    assert.deepEqual(render(tool).slice(2), compactDetails, `${name}: expanded compact matches full exactly`);
+    await commands.get("pretty-tui").handler("compact", ctx);
+    const opened = render(tool);
+    tool.handleMouse({ type: "click", button: "left", x: 6, y, width: 100, height: opened.length });
+    assert.equal(tool.expanded, false);
+    assert.ok(!render(tool).join("\n").includes("PRIVATE_"));
+    for (const width of [8, 12, 40]) assert.ok(render(tool, width).every((line) => visibleWidth(line) <= width));
+  }
+  const longCommand = 'rg -n "accent" extensions/full-frame.ts extensions/tool-presentation.ts; rg -n "title|accent|success" tests/regression.mjs | tail -12';
+  const wrappedBash = new ToolExecutionComponent("bash", "compact-wrapped-bash", { command: longCommand }, undefined, tools.get("bash"), { requestRender() {} }, process.cwd());
+  wrappedBash.updateResult({ content: [{ type: "text", text: "Done" }], isError: false });
+  for (const width of [40, 80, 100]) {
+    const rows = render(wrappedBash, width);
+    assert.ok(rows.some((line) => line.includes("$ rg")), "wrapped command retains shell prompt");
+    assert.ok(!rows.join("\n").includes("●"), "wrapped compact call has no old dot");
+    assert.ok(!rows.join("\n").includes("bash("), "wrapped compact call has no repeated name");
+    assert.ok(rows.some((line) => line.includes("✓ Done")), "result summary is styled even after a multiline call");
+    assert.ok(!rows.join("\n").includes("└"));
+    assert.ok(rows.every((line) => visibleWidth(line) <= width));
+  }
+  const host = { ui: { requestRender() {} }, chatContainer: { children: components }, loadedResourcesContainer: { children: [] },
+    toolOutputExpanded: false, showStatus() {}, setToolsExpanded: InteractiveMode.prototype.setToolsExpanded };
+  InteractiveMode.prototype.toggleToolOutputExpansion.call(host);
+  assert.ok(components.every((tool) => tool.expanded));
+  InteractiveMode.prototype.toggleToolOutputExpansion.call(host);
+  assert.ok(components.every((tool) => !tool.expanded));
+  const message = { role: "assistant", timestamp: "compact-panel-thought", content: [
+    { type: "thinking", thinking: "COMPACT_FIRST_LINE\nPRIVATE_COMPACT_THOUGHT" }, { type: "text", text: "VISIBLE_COMPACT_REPLY" },
+  ] };
+  const thought = new AssistantMessageComponent(message);
+  let thoughtRows = render(thought);
+  assert.ok(thoughtRows.some((line) => line.includes("thought ▸")));
+  assert.ok(thoughtRows.some((line) => line.includes("COMPACT_FIRST_LINE")), "collapsed thought previews its first content line");
+  assert.ok(!thoughtRows.join("\n").includes("PRIVATE_COMPACT_THOUGHT"));
+  assert.ok(thoughtRows.some((line) => line.includes("╭─ Assistant")));
+  const thoughtY = thoughtRows.findIndex((line) => line.includes("COMPACT_FIRST_LINE"));
+  thought.handleMouse({ type: "click", button: "left", x: 6, y: thoughtY, width: 100, height: thoughtRows.length });
+  thoughtRows = render(thought);
+  assert.ok(thoughtRows.join("\n").includes("PRIVATE_COMPACT_THOUGHT"));
+  assert.ok(thoughtRows.some((line) => line.includes("thought ▾")));
+  assert.equal(thoughtRows.filter((line) => line.includes("VISIBLE_COMPACT_REPLY")).length, 1);
+  const writes = [];
+  const visibilityHost = {
+    hideThinkingBlock: false,
+    settingsManager: { setHideThinkingBlock(value) { writes.push(value); } },
+    chatContainer: { children: [thought] }, ui: { requestRender() {} }, showStatus() {},
+    updateThinkingBlockVisibility: InteractiveMode.prototype.updateThinkingBlockVisibility,
+  };
+  InteractiveMode.prototype.toggleThinkingBlockVisibility.call(visibilityHost);
+  assert.ok(render(thought).join("\n").includes("PRIVATE_COMPACT_THOUGHT"));
+  InteractiveMode.prototype.toggleThinkingBlockVisibility.call(visibilityHost);
+  assert.ok(!render(thought).join("\n").includes("PRIVATE_COMPACT_THOUGHT"));
+  assert.deepEqual(writes, [false, true], "Ctrl+T follows compact's initially collapsed visibility");
+  await commands.get("pretty-tui").handler("clean", ctx);
+}
+
+// Full cards delegate to native built-in renderers and retain their information
+// at the same content width. Native expansion, third-party clicks and separate
+// thinking runs remain owned by Pi, not the compact activity projection.
+{
+  const runtime = await import("@earendil-works/pi-coding-agent");
+  const ctx = { hasUI: true, ui: { notify() {} } };
+  await commands.get("pretty-tui").handler("full", ctx);
+  await emit("session_start", {}, sessionContext([]));
+  const nativeRender = originalPrototypeMethods.find(([name]) => name === "ToolExecutionComponent.render")[3];
+  const { stripAnsiBackgrounds } = await jiti.import(join(process.cwd(), "extensions/ansi-style.ts"));
+  const normalize = (lines) => lines.map(stripTerminalSequences).map((line) => line.trim()).filter(Boolean);
+  const cases = [
+    ["read", runtime.createReadToolDefinition, { path: "source.ts", offset: 10, limit: 5 }, "const answer = 42;\nconsole.log(answer);", {}],
+    ["bash", runtime.createBashToolDefinition, { command: "printf 'alpha\\nbeta\\n'" }, "alpha\nbeta\n", { exitCode: 0 }],
+    ["edit", runtime.createEditToolDefinition, { path: "fixture.ts", edits: [{ oldText: "before", newText: "after" }] }, "Successfully replaced text", { diff: "-1 before\n+1 after", firstChangedLine: 1 }],
+    ["write", runtime.createWriteToolDefinition, { path: "notes.txt", content: Array.from({ length: 20 }, (_, i) => `LINE_${i}`).join("\n") }, "Successfully wrote notes.txt", {}],
+    ["grep", runtime.createGrepToolDefinition, { pattern: "answer", path: "." }, "source.ts:10:const answer = 42;", {}],
+    ["find", runtime.createFindToolDefinition, { pattern: "*.ts", path: "." }, "source.ts\nfixture.ts", {}],
+    ["ls", runtime.createLsToolDefinition, { path: "." }, "source.ts\nnotes.txt", {}],
+  ];
+  for (const [name, factory, args, text, details] of cases) {
+    const nativeDefinition = factory(process.cwd());
+    const tool = new ToolExecutionComponent(name, `full-card-${name}`, args, undefined, tools.get(name), { requestRender() {} }, process.cwd());
+    const baseline = new ToolExecutionComponent(name, `native-card-${name}`, args, undefined, nativeDefinition, { requestRender() {} }, process.cwd());
+    const toolResult = { content: [{ type: "text", text }], details, isError: false, durationMs: 1234 };
+    tool.updateResult(toolResult); baseline.updateResult(toolResult);
+    const host = { ui: { requestRender() {} }, chatContainer: { children: [tool] }, loadedResourcesContainer: { children: [] }, toolOutputExpanded: false, showStatus() {} };
+    for (const expanded of [false, true, false]) {
+      InteractiveMode.prototype.setToolsExpanded.call(host, expanded);
+      baseline.setExpanded(expanded);
+      const rows = tool.render(100).map(stripTerminalSequences);
+      assert.ok(rows[2].includes(`╭─ ${name}`), rows.join("\n"));
+      assert.equal(rows.filter((line) => line.trimStart().startsWith("╭─")).length, 1, name);
+      assert.ok(rows[2].includes(`╭─ ${name} `));
+      // Our registered tools render their own shell. The native default shell
+      // contributes two extra padding columns, so compare equal content widths.
+      const nativeWidth = nativeDefinition.renderShell === "self" ? 94 : 96;
+      assert.deepEqual(normalize(tool.selfRenderContainer.render(94)), normalize(nativeRender.call(baseline, nativeWidth)), name);
+      assert.ok(!rows.join("\n").includes("nested calls"));
+      assert.ok(!rows.join("\n").includes("Updated ·"));
+    }
+    const fullRows = tool.render(100);
+    if (name === "edit") {
+      const plain = fullRows.map(stripTerminalSequences);
+      assert.equal(plain.filter((line) => line.trimStart().startsWith("╭─")).length, 1);
+      assert.ok(!plain.includes("  │"));
+      assert.ok(plain.some((line) => line.trimStart().startsWith("├─ Output")));
+    }
+    if (name === "read") {
+      const y = fullRows.map(stripTerminalSequences).findIndex((line) => line.includes("source.ts"));
+      tool.handleMouse({ type: "click", button: "left", x: 8, y, width: 100, height: fullRows.length });
+      assert.equal(tool.expanded, true, "native call click still expands the result inside the frame");
+      assert.ok(tool.render(100).map(stripTerminalSequences).join("\n").includes("console.log(answer)"));
+      const expandedRows = tool.render(100).map(stripTerminalSequences);
+      assert.equal(expandedRows.filter((line) => line.trimStart().startsWith("╭─")).length, 1);
+      assert.ok(expandedRows.some((line) => line.trimStart().startsWith("├─ Output")));
+      const resultY = expandedRows.findIndex((line) => line.includes("console.log(answer)"));
+      tool.handleMouse({ type: "click", button: "left", x: 8, y: resultY, width: 100, height: expandedRows.length });
+      assert.equal(tool.expanded, false, "result-card click maps back to the native result region");
+      assert.equal(tool.render(100).map(stripTerminalSequences).filter((line) => line.trimStart().startsWith("╭─")).length, 1);
+    }
+  }
+  for (const command of [
+    ["node --input-type=module <<'JS'", "import {initTheme} from '@earendil-works/pi-coding-agent';", "console.log('Pi theme color mode:');", "JS"].join("\n"),
+    ["python3 - <<'PY'", "from pathlib import Path", "p=Path('README.md');s=p.read_text().replace('old', 'new')", "p.write_text(s)", "PY", "npm pack --dry-run && git diff --check"].join("\n"),
+  ]) {
+    const nativeOnly = new ToolExecutionComponent("bash", "native-heredoc-highlight", { command, timeout: 10 }, undefined,
+      runtime.createBashToolDefinition(process.cwd()), { requestRender() {} }, process.cwd());
+    nativeOnly.render(100);
+    const expected = runtime.highlightCode(command, "bash").join("\n");
+    assert.notEqual(expected, command);
+    assert.ok(nativeOnly.callRendererComponent.text.includes(expected), "native/history renderer path must get full-mode shell highlighting too");
+    assert.equal(stripTerminalSequences(nativeOnly.callRendererComponent.text), `$ ${command} (timeout 10s)`);
+  }
+  const shellSource = [
+    'if [ -n "$HOME" ]; then',
+    '  printf "%s\\n" "$HOME" # keep comment',
+    'fi',
+  ].join("\n");
+  const shellArgs = Object.freeze({ command: shellSource, timeout: 12 });
+  const highlightedShell = new ToolExecutionComponent("bash", "full-shell-colors", shellArgs, undefined, tools.get("bash"), { requestRender() {} }, process.cwd());
+  highlightedShell.render(100);
+  const callText = highlightedShell.callRendererComponent.text;
+  assert.equal(stripTerminalSequences(callText), `$ ${shellSource} (timeout 12s)`, "highlighting preserves native prompt, command, whitespace and timeout");
+  const expectedHighlight = runtime.highlightCode(shellSource, "bash").join("\n");
+  assert.notEqual(expectedHighlight, shellSource, "fixture contains real shell syntax colors");
+  assert.ok(callText.includes(expectedHighlight));
+  assert.ok(new Set(callText.match(/\x1b\[(?:38;[^m]+|3[0-7]|9[0-7])m/g)).size >= 3);
+  assert.equal(highlightedShell.args, shellArgs, "execution arguments remain unchanged");
+  for (const command of ["[", "$", " ", "if", "printf '%s' m"]) {
+    highlightedShell.updateArgs({ command });
+    highlightedShell.render(100);
+    assert.equal(stripTerminalSequences(highlightedShell.callRendererComponent.text), `$ ${command}`, "short streamed commands must not replace ANSI prefixes or the shell prompt");
+  }
+  highlightedShell.updateArgs({ command: 'echo "$UNFINISHED', timeout: 12 });
+  highlightedShell.render(100);
+  assert.equal(stripTerminalSequences(highlightedShell.callRendererComponent.text), '$ echo "$UNFINISHED (timeout 12s)', "incomplete streamed syntax remains visible");
+  highlightedShell.updateArgs({ command: null });
+  highlightedShell.render(100);
+  assert.ok(stripTerminalSequences(highlightedShell.callRendererComponent.text).includes("..."));
+  highlightedShell.updateArgs({ command: {} });
+  highlightedShell.render(100);
+  assert.ok(stripTerminalSequences(highlightedShell.callRendererComponent.text).includes("[invalid arg]"));
+  const answerOnly = new AssistantMessageComponent({ role: "assistant", timestamp: "full-answer-region", content: [
+    { type: "text", text: "REPLY_CLICK_TARGET" }, { type: "text", text: "SECOND_REPLY_BLOCK" },
+  ] });
+  let replyMouse;
+  const nativeReply = answerOnly.contentContainer.children.find((child) => child instanceof Markdown);
+  nativeReply.handleMouse = (event) => { replyMouse = event; return { handled: true }; };
+  const answerRows = answerOnly.render(100).map(stripTerminalSequences);
+  const headingY = answerRows.findIndex((line) => line.trimStart().startsWith("╭─ Assistant "));
+  const replyY = answerRows.findIndex((line) => line.includes("REPLY_CLICK_TARGET"));
+  assert.ok(headingY >= 1 && answerRows[headingY - 1] === "");
+  assert.ok(answerRows[headingY + 1].trimStart().startsWith("│"));
+  assert.ok(answerRows.at(-1).trimStart().startsWith("╰"));
+  assert.equal(answerRows.filter((line) => line.trimStart().startsWith("╭─ Assistant ")).length, 1, "one response card for consecutive text blocks");
+  assert.ok(answerRows.join("\n").includes("SECOND_REPLY_BLOCK"));
+  answerOnly.handleMouse({ type: "click", button: "left", x: 10, y: replyY, width: 100, height: answerRows.length });
+  assert.equal(replyMouse.y, 0, "answer decoration keeps native Markdown hit coordinates");
+  assert.equal(replyMouse.x, 7);
+  assert.equal(replyMouse.width, 94);
+  const realClock = Date.now;
+  let timerNow = 5000;
+  Date.now = () => timerNow;
+  const timed = new ToolExecutionComponent("bash", "full-border-timer", { command: "echo timer" }, undefined, tools.get("bash"), { requestRender() {} }, process.cwd());
+  try {
+    timed.markExecutionStarted();
+    timerNow = 7000;
+    timed.updateResult({ content: [{ type: "text", text: "Took 2.0s\nUSER_OUTPUT_MUST_REMAIN" }], isError: false }, true);
+    let timerRows = timed.render(100).map(stripTerminalSequences);
+    assert.ok(timerRows.at(-1).includes("Elapsed 2.0s"));
+    assert.ok(timerRows.at(-1).trimStart().startsWith("╰"));
+    assert.ok(!timerRows.slice(0, -1).some((line) => line.includes("Elapsed 2.0s")));
+    timed.updateResult({ content: [{ type: "text", text: "Took 2.0s\nUSER_OUTPUT_MUST_REMAIN" }], isError: false, durationMs: 2000 });
+    timerRows = timed.render(100).map(stripTerminalSequences);
+    assert.ok(timerRows.at(-1).includes("Took 2.0s"));
+    assert.equal(timerRows.filter((line) => line.includes("Took 2.0s")).length, 2, "a user output line identical to the timer must remain");
+    assert.ok(timerRows.some((line) => line.includes("USER_OUTPUT_MUST_REMAIN")));
+    const narrowTimer = timed.render(12).map(stripTerminalSequences).join("\n");
+    assert.ok(narrowTimer.includes("Took"), "when the border cannot fit timing, keep native timing in the body");
+    const resultRow = timerRows.findIndex((line) => line.includes("USER_OUTPUT_MUST_REMAIN"));
+    timed.handleMouse({ type: "click", button: "left", x: 6, y: resultRow, width: 100, height: timerRows.length });
+    assert.equal(timed.expanded, true, "moved timer and background panels preserve native mouse offsets");
+  } finally {
+    Date.now = realClock;
+  }
+  const unknown = new ToolExecutionComponent("history-only", "full-unknown", { query: "EXACT_ARGUMENT" }, undefined, undefined, { requestRender() {} }, process.cwd());
+  unknown.updateResult({ content: [{ type: "text", text: "EXACT_RESULT" }], isError: false });
+  const unknownRows = unknown.render(100).map(stripTerminalSequences).join("\n");
+  assert.ok(unknownRows.includes("╭─ history-only "));
+  assert.ok(unknownRows.includes("├─ Output"));
+  assert.ok(unknownRows.includes("EXACT_ARGUMENT"));
+  assert.ok(unknownRows.includes("EXACT_RESULT"));
+  let nativeClick;
+  const interactive = new ToolExecutionComponent("third-party", "full-native-button", {}, undefined, {
+    renderShell: "self", renderCall: () => ({ render: () => ["THIRD_PARTY_BUTTON"], invalidate() {},
+      handleMouse(event) { nativeClick = event; return { handled: true }; } }),
+  }, { requestRender() {} }, process.cwd());
+  let rows = interactive.render(100).map(stripTerminalSequences);
+  interactive.handleMouse({ type: "click", button: "left", x: 12, y: rows.findIndex((line) => line.includes("THIRD_PARTY_BUTTON")), width: 100, height: rows.length });
+  assert.equal(nativeClick.y, 0); assert.equal(nativeClick.x, 9); assert.equal(nativeClick.width, 94);
+  let resultClick;
+  const interactiveResult = new ToolExecutionComponent("custom-result", "full-output-button", {}, undefined, {
+    renderShell: "self", renderCall: () => new Text("CALL_REGION", 0, 0),
+    renderResult: () => Object.assign(new Text("BTN_OK\n" + "长结果内容 ".repeat(30), 0, 0), {
+      handleMouse(event) { resultClick = event; return { handled: true }; },
+    }),
+  }, { requestRender() {} }, process.cwd());
+  interactiveResult.updateResult({ content: [{ type: "text", text: "result" }], isError: false });
+  for (const width of [12, 16, 40, 100]) {
+    const resultRows = interactiveResult.render(width).map(stripTerminalSequences);
+    assert.ok(resultRows.every((line) => visibleWidth(line) <= width));
+    const y = resultRows.findIndex((line) => line.includes("BTN_OK"));
+    if (width >= 16) {
+      assert.ok(resultRows.some((line) => line.trimStart().startsWith("├─ Output")));
+      interactiveResult.handleMouse({ type: "click", button: "left", x: 12, y, width, height: resultRows.length });
+      assert.equal(resultClick.x, width >= 20 ? 9 : 10, "output click subtracts the shared frame padding");
+      assert.equal(resultClick.y, 0);
+      assert.equal(resultClick.width, width - 4 - (width >= 20 ? 2 : 0));
+    }
+  }
+  const message = { role: "assistant", timestamp: "full-native-runs", content: [
+    { type: "thinking", thinking: "FIRST_NATIVE_THOUGHT" }, { type: "text", text: "FIRST_NATIVE_ANSWER" },
+    { type: "thinking", thinking: "SECOND_NATIVE_THOUGHT" }, { type: "text", text: "SECOND_NATIVE_ANSWER" },
+  ] };
+  const thought = new AssistantMessageComponent(message);
+  const renderThought = () => thought.render(100).map(stripTerminalSequences);
+  rows = renderThought();
+  assert.equal(rows.filter((line) => line.includes("╭─ thought")).length, 2);
+  const joined = rows.join("\n");
+  assert.ok(joined.indexOf("FIRST_NATIVE_THOUGHT") < joined.indexOf("FIRST_NATIVE_ANSWER"));
+  assert.ok(joined.indexOf("FIRST_NATIVE_ANSWER") < joined.indexOf("SECOND_NATIVE_THOUGHT"));
+  thought.handleMouse({ type: "click", button: "left", x: 6, y: rows.findIndex((line) => line.includes("╭─ thought")), width: 100, height: rows.length });
+  assert.ok(!renderThought().join("\n").includes("FIRST_NATIVE_THOUGHT"));
+  assert.ok(renderThought().join("\n").includes("SECOND_NATIVE_THOUGHT"));
+  assert.ok(renderThought().join("\n").includes("FIRST_NATIVE_ANSWER"));
+  thought.setHideThinkingBlock(true);
+  assert.ok(!renderThought().join("\n").includes("SECOND_NATIVE_THOUGHT"));
+  thought.setHideThinkingBlock(false);
+  assert.ok(renderThought().join("\n").includes("FIRST_NATIVE_THOUGHT"));
+  // A saved hidden setting must not silently fold full's initial thought.
+  const initiallyHidden = new AssistantMessageComponent({ ...message, timestamp: "full-default-open" }, true);
+  assert.ok(initiallyHidden.render(100).map(stripTerminalSequences).join("\n").includes("FIRST_NATIVE_THOUGHT"));
+  const visibilityWrites = [];
+  const visibilityHost = {
+    hideThinkingBlock: true,
+    settingsManager: { setHideThinkingBlock(value) { visibilityWrites.push(value); } },
+    chatContainer: { children: [initiallyHidden] }, ui: { requestRender() {} }, showStatus() {},
+    updateThinkingBlockVisibility: InteractiveMode.prototype.updateThinkingBlockVisibility,
+  };
+  InteractiveMode.prototype.toggleThinkingBlockVisibility.call(visibilityHost);
+  assert.ok(!initiallyHidden.render(100).map(stripTerminalSequences).join("\n").includes("FIRST_NATIVE_THOUGHT"));
+  InteractiveMode.prototype.toggleThinkingBlockVisibility.call(visibilityHost);
+  assert.ok(initiallyHidden.render(100).map(stripTerminalSequences).join("\n").includes("FIRST_NATIVE_THOUGHT"));
+  assert.deepEqual(visibilityWrites, [true, false]);
+  await commands.get("pretty-tui").handler("clean", ctx);
+}
+
 // When testing against modern Pi, execute an actual QuickJS codemode script
 // through Pi's nested runner, not only hand-written UI events. The project's
 // older baseline has no codemode export and intentionally skips this block.
@@ -2984,10 +3764,22 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
     const commandContext = { hasUI: true, ui: { notify() {} } };
     for (const mode of ["full", "compact"]) {
       await commands.get("pretty-tui").handler(mode, commandContext);
-      const nativeLines = tool.render(100).map(stripTerminalSequences).join("\n");
-      assert.match(nativeLines, /FINAL ONLY/);
-      assert.ok(!nativeLines.includes("nested calls"));
-      assert.ok(!nativeLines.includes("[Script output]"));
+      const rows = tool.render(100).map(stripTerminalSequences);
+      const sharedLines = rows.join("\n");
+      assert.ok(!/(?:Running|Done)\(\d+ tool calls/.test(sharedLines));
+      if (mode === "full") {
+        assert.match(sharedLines, /FINAL ONLY/);
+        assert.ok(rows.at(-1).trimStart().startsWith("╰") && rows.at(-1).includes("Took"), "native codemode duration moves to the result border");
+        assert.ok(!sharedLines.includes("Nested calls (2)"));
+        assert.ok(!sharedLines.includes("[Script output]"), "full keeps the native parent output");
+      } else {
+        assert.match(sharedLines, /fixture\(path=one.txt\)/);
+        assert.match(sharedLines, /fixture\(path=two.txt\)/);
+        assert.match(sharedLines, /2 nested calls/);
+        const outputY = rows.findIndex((line) => line.includes("[Script output]"));
+        tool.handleMouse({ type: "click", button: "left", x: 14, y: outputY, width: 100, height: rows.length });
+        assert.match(tool.render(100).map(stripTerminalSequences).join("\n"), /FINAL ONLY/);
+      }
     }
     await commands.get("pretty-tui").handler("clean", commandContext);
     await emit("session_before_compact"); await emit("agent_settled");
@@ -3096,17 +3888,17 @@ if (typeof InteractiveMode.prototype.addCacheMissNotice === "function") {
   liveNotice.handleMouse({ type: "click", button: "left", x: 7, y: liveRows.length - 1, width: 120, height: liveRows.length });
   assert.equal(render(liveNotice), "");
 
-  // Native full/compact mode retain the original spacer and text presentation.
+  // All modes retain the same cache-warning content and semantic styling.
   const commandContext = { hasUI: true, ui: { notify() {} } };
   for (const mode of ["full", "compact"]) {
     await commands.get("pretty-tui").handler(mode, commandContext);
     assert.match(render(liveNotice), /Cache miss: 79k/);
-    assert.ok(!render(liveNotice).includes("⚠"), "existing notice did not switch back to native rendering");
+    assert.ok(render(liveNotice).includes("⚠"));
     host.chatContainer.children = [];
     InteractiveMode.prototype.addCacheMissNotice.call(host, { ...miss, modelChanged: true });
-    assert.equal(host.chatContainer.children.length, 2);
+    assert.equal(host.chatContainer.children.length, 1);
     assert.match(host.chatContainer.children.map(render).join("\n"), /Cache miss after model switch/);
-    assert.ok(!host.chatContainer.children.map(render).join("\n").includes("⚠"));
+    assert.ok(host.chatContainer.children.map(render).join("\n").includes("⚠"));
   }
   await commands.get("pretty-tui").handler("clean", commandContext);
   liveTool.setExpanded(true);

@@ -53,11 +53,24 @@ const compactArgs = (value: string): string => {
 export class NestedTools {
   private calls = new Map<string, NestedCall>();
   private incomplete = new Set<string>();
+  private renderCache = new Map<string, {
+    width: number; theme: any; palette: string; args: any; result: any;
+    expanded: boolean; partial: boolean; label: string; rootDetails: boolean;
+    projection: { lines: string[]; actions: Map<number, string> };
+  }>();
+  private countCache = new Map<string, number>();
+  private invalidateRender(rootId?: string) {
+    if (rootId) this.renderCache.delete(rootId);
+    else this.renderCache.clear();
+    this.countCache.clear();
+  }
+
   // Local overrides can close one disclosure even after global expansion.
   private expanded = new Map<string, boolean>();
-  clearExpansion() { this.expanded.clear(); }
+  clearExpansion() { this.expanded.clear(); this.invalidateRender(); }
   clear() { this.calls.clear(); this.incomplete.clear(); this.clearExpansion(); }
   toggle(key: string, globallyExpanded = false) {
+    this.invalidateRender(this.calls.has(key) ? this.root(key) : key.replace(/:(?:script|output)$/, ""));
     this.expanded.set(key, !(this.expanded.get(key) ?? globallyExpanded));
   }
   private isExpanded(key: string, globallyExpanded: boolean): boolean {
@@ -74,15 +87,21 @@ export class NestedTools {
     return [...this.calls.values()].filter((call) => call.parentId === parentId);
   }
   count(rootId: string): number {
-    return [...this.calls.values()].filter((call) => this.root(call.id) === rootId).length;
+    const cached = this.countCache.get(rootId);
+    if (cached !== undefined) return cached;
+    const count = [...this.calls.values()].filter((call) => this.root(call.id) === rootId).length;
+    this.countCache.set(rootId, count);
+    return count;
   }
   start(event: any) {
     if (!event.parentToolCallId || this.calls.has(event.toolCallId)) return;
     const rootId = this.root(event.parentToolCallId);
+    this.invalidateRender(rootId);
     if (this.count(rootId) >= NESTED_LIMITS.calls) { this.incomplete.add(rootId); return; }
     const args = argsText(event.args);
     const argsTruncated = args.length >= NESTED_LIMITS.args;
     if (argsTruncated) this.incomplete.add(rootId);
+    this.countCache.clear();
     this.calls.set(event.toolCallId, {
       id: event.toolCallId, parentId: event.parentToolCallId, name: bounded(String(event.toolName ?? "tool"), 256),
       args, argsTruncated, status: "running", startedAt: Date.now(),
@@ -91,6 +110,7 @@ export class NestedTools {
   update(event: any, finished = false) {
     const call = this.calls.get(event.toolCallId);
     if (!call) return;
+    this.invalidateRender(this.root(call.id));
     const text = resultText(finished ? event.result : event.partialResult);
     const rootId = this.root(call.id);
     const otherSize = [...this.calls.values()].filter((other) => other.id !== call.id && this.root(other.id) === rootId)
@@ -105,6 +125,7 @@ export class NestedTools {
     }
   }
   finish(rootId: string): boolean {
+    this.invalidateRender(rootId);
     let changed = false;
     for (const call of this.calls.values()) {
       if (this.root(call.id) === rootId && call.status === "running") {
@@ -124,6 +145,7 @@ export class NestedTools {
       records = records.calls;
     }
     if (!Array.isArray(records)) return;
+    this.invalidateRender(rootId);
     for (const record of records) {
       if (typeof record?.id !== "string" || typeof record?.name !== "string" || record.id.endsWith("/?")) continue;
       const existing = this.calls.get(record.id);
@@ -137,6 +159,7 @@ export class NestedTools {
       const slash = record.id.lastIndexOf("/");
       const candidate = record.id.slice(0, slash);
       const parentId = this.calls.has(candidate) ? candidate : rootId;
+      this.countCache.clear();
       this.calls.set(record.id, {
         id: record.id, parentId, name: bounded(record.name, 256),
         args: typeof record.args === "string" ? recordedArgs(record.args) : record.argumentsBytes !== undefined ? "[Arguments omitted by Pi]" : argsText(record.arguments),
@@ -172,6 +195,7 @@ export class NestedTools {
   }
   restore(data: any) {
     if (data?.version !== 1 || typeof data.rootId !== "string" || !Array.isArray(data.calls)) return;
+    this.invalidateRender(data.rootId);
     // Snapshot entries originate locally; still validate and bound every field.
     let budget = NESTED_LIMITS.total;
     for (const call of data.calls.slice(0, NESTED_LIMITS.calls)) {
@@ -186,13 +210,24 @@ export class NestedTools {
     }
     if (data.incomplete) this.incomplete.add(data.rootId);
   }
-  render(owner: any, width: number, theme: any): { lines: string[]; actions: Map<number, string> } {
+  render(owner: any, width: number, theme: any, options: { rootDetails?: boolean } = {}): { lines: string[]; actions: Map<number, string> } {
     const rootId = owner.toolCallId;
+    // Timer ticks and scrolling do not change tool content. Reuse wrapped
+    // detail rows and hit regions until data, layout, expansion or colors change.
+    const palette = ["dim", "muted", "text", "success", "error", "warning", "mdLink", "toolOutput"]
+      .map((role) => theme.fg(role, "x")).join("|") + theme.bold("x");
+    const expanded = Boolean(owner.expanded);
+    const partial = Boolean(owner.isPartial);
+    const rootDetails = options.rootDetails !== false;
+    const label = owner.toolDefinition?.label ?? owner.toolName;
+    const cached = this.renderCache.get(rootId);
+    if (cached && cached.width === width && cached.theme === theme && cached.palette === palette &&
+      cached.args === owner.args && cached.result === owner.result && cached.expanded === expanded &&
+      cached.partial === partial && cached.label === label && cached.rootDetails === rootDetails) return cached.projection;
     const actions = new Map<number, string>();
     const count = this.count(rootId);
     const failed = [...this.calls.values()].filter((call) => this.root(call.id) === rootId && call.status === "error").length;
     const color = owner.result?.isError ? "error" : owner.result && !owner.isPartial ? "success" : "dim";
-    const label = owner.toolDefinition?.label ?? owner.toolName;
     const lines = [theme.fg(color, "● ") + theme.fg("text", theme.bold(label)) +
       theme.fg("muted", `(${count} nested ${count === 1 ? "call" : "calls"}${failed ? ` · ${failed} failed` : ""})`)];
     const detail = (text: string, prefix: string, action?: string) => {
@@ -210,7 +245,13 @@ export class NestedTools {
       }
       if (safeText(text).length > NESTED_LIMITS.output) push(theme.fg("dim", prefix + "[Preview truncated]"));
     };
-    const items = this.children(rootId);
+    const childLists = new Map<string, NestedCall[]>();
+    for (const call of this.calls.values()) {
+      const siblings = childLists.get(call.parentId) ?? [];
+      siblings.push(call);
+      childLists.set(call.parentId, siblings);
+    }
+    const items = childLists.get(rootId) ?? [];
     const visit = (call: NestedCall, indent: string, last: boolean, depth: number) => {
       const prefix = indent + (last ? "└─ " : "├─ ");
       const continuation = indent + (last ? "   " : "│  ");
@@ -218,7 +259,7 @@ export class NestedTools {
       const callColor = call.status === "ok" ? "success" : call.status === "error" ? "error" : call.status === "running" ? "dim" : "muted";
       actions.set(lines.length, call.id);
       const duration = call.durationMs === undefined ? "" : ` · ${call.durationMs < 1000 ? `${Math.round(call.durationMs)}ms` : `${(call.durationMs / 1000).toFixed(1)}s`}`;
-      const descendants = this.children(call.id);
+      const descendants = childLists.get(call.id) ?? [];
       lines.push(theme.fg("dim", prefix) + theme.fg(callColor, icon + " ") + theme.fg("text", theme.bold(call.name)) + theme.fg("muted", `(${compactArgs(call.args)})${duration}`));
       const expanded = this.isExpanded(call.id, Boolean(owner.expanded));
       const first = call.output?.split("\n").find((line) => line.trim());
@@ -235,17 +276,22 @@ export class NestedTools {
       else if (descendants.length) detail("[Deeper calls omitted]", continuation);
     };
     const code = typeof owner.args?.code === "string" ? owner.args.code : undefined;
-    if (code) {
+    if (code && options.rootDetails !== false) {
       const key = `${rootId}:script`;
       actions.set(lines.length, key); lines.push(theme.fg("dim", "  ├─ ") + theme.fg("mdLink", "[Script]"));
       if (this.isExpanded(key, Boolean(owner.expanded))) detail(code, "  │  ", key);
     }
-    items.forEach((call) => visit(call, "  ", false, 0));
-    const key = `${rootId}:output`;
-    actions.set(lines.length, key);
-    lines.push(theme.fg("dim", "  └─ ") + theme.fg("mdLink", code ? "[Script output]" : "[Output]"));
-    if (this.isExpanded(key, Boolean(owner.expanded))) detail(resultText(owner.result) || (owner.isPartial || !owner.result ? "Running…" : "No text output"), "     ", key);
+    items.forEach((call, index) => visit(call, "  ", options.rootDetails === false && index === items.length - 1, 0));
+    if (options.rootDetails !== false) {
+      const key = `${rootId}:output`;
+      actions.set(lines.length, key);
+      lines.push(theme.fg("dim", "  └─ ") + theme.fg("mdLink", code ? "[Script output]" : "[Output]"));
+      if (this.isExpanded(key, Boolean(owner.expanded))) detail(resultText(owner.result) || (owner.isPartial || !owner.result ? "Running…" : "No text output"), "     ", key);
+    }
     if (this.incomplete.has(rootId)) lines.push(theme.fg("warning", "  [Nested call record is incomplete or truncated]"));
-    return { lines: lines.map((line) => truncateToWidth(line, Math.max(1, width), "…")), actions };
+    const projection = { lines: lines.map((line) => truncateToWidth(line, Math.max(1, width), "…")), actions };
+    this.renderCache.set(rootId, { width, theme, palette, args: owner.args, result: owner.result,
+      expanded, partial, label, rootDetails, projection });
+    return projection;
   }
 }
