@@ -29,6 +29,7 @@ import {
   getAgentDir,
   getMarkdownTheme,
   type ExtensionAPI,
+  type ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
@@ -76,6 +77,26 @@ const loadConfig = (path: string): PrettyTuiConfig => {
     return {};
   }
 };
+
+// --- LOCAL FORK PATCH (see LOCAL-PATCHES.md) -------------------------------------------
+//
+// This extension must never own a tool name. Pi allows only one owner per tool name and
+// fails the whole loser extension when two register the same one, and bizzy (background
+// tasks) owns `bash`. Every built-in rendered here is render-only, so the registrations go
+// through `pi.registerToolRenderer`, which composes: resolvers run in extension load order
+// and `next()` chains to the remaining resolvers and then to whichever extension owns the
+// tool.
+//
+// The resolver's return value replaces the tool definition Pi renders with, so returning
+// `renderers` alone would drop the owner's name, description, parameters, label, and any
+// extra fields it carries. Spread the owner over our renderers to change only drawing.
+function registerRenderedTool(pi: ExtensionAPI, tool: { name?: string }, renderers: ToolRenderers): void {
+  const toolName = tool.name;
+  if (!toolName) throw new Error("registerRenderedTool needs a named tool definition");
+  pi.registerToolRenderer((name, next) =>
+    name === toolName ? { ...next(), ...renderers } : next(),
+  );
+}
 
 /** Polished user messages, tool calls, and list rendering for Pi's TUI. */
 export default function prettyTui(pi: ExtensionAPI) {
@@ -4345,7 +4366,8 @@ export default function prettyTui(pi: ExtensionAPI) {
       state[kind] = component;
       return component;
     };
-    pi.registerTool({ ...definition,
+    registerRenderedTool(pi, definition, {
+      ...(definition.renderShell ? { renderShell: definition.renderShell } : {}),
       renderCall: (...args: any[]) => select("renderCall", args),
       renderResult: (...args: any[]) => select("renderResult", args),
     });
