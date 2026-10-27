@@ -1,9 +1,12 @@
 import { cardSurface } from "./card-surface.js";
 import { isNativeImageRow, stripAnsiBackgrounds } from "./ansi-style.js";
+import { ruleRows } from "./selection-chrome.js";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 export type NativeFrame = {
   lines: string[]; sourceRows: Map<number, number>; contentWidth: number; inset: number;
+  /** Rows that are pure frame; copying must skip them entirely. */
+  frameRows: Set<number>;
 };
 const frameCache = new WeakMap<object, {
   title: string; source: string[]; width: number; palette: string; sections: string; frame: NativeFrame;
@@ -52,7 +55,10 @@ function renderPanel(
   const sourceRows = new Map<number, number>();
   if (width < 8) {
     source.forEach((_, y) => sourceRows.set(y, y));
-    return { lines: source.map((row) => cardBackground(row, width, theme, background, borderColor)), sourceRows, contentWidth: Math.max(1, width), inset: 0 };
+    return {
+      lines: source.map((row) => cardBackground(row, width, theme, background, borderColor)),
+      sourceRows, contentWidth: Math.max(1, width), inset: 0, frameRows: new Set<number>(),
+    };
   }
   const contentWidth = width - 4;
   const border = (s: string) => theme.fg(borderColor, s);
@@ -78,7 +84,16 @@ function renderPanel(
   lines.push(footerFits
     ? border("╰" + "─".repeat(width - visibleWidth(footer) - 5) + " " + footer + " ─╯")
     : border("╰" + "─".repeat(width - 2) + "╯"));
-  const frame = { lines: lines.map((line) => cardBackground(line, width, theme, background, borderColor)), sourceRows, contentWidth, inset: 2 };
+  const sectionRows = new Set<number>();
+  // Sections push a divider before their first content row; recover those rows
+  // from the finished line list so the set matches `lines` exactly.
+  for (let y = 1; y < lines.length - 1; y++) {
+    if (stripTerminalSequences(lines[y]).startsWith("├")) sectionRows.add(y);
+  }
+  const frame = {
+    lines: lines.map((line) => cardBackground(line, width, theme, background, borderColor)),
+    sourceRows, contentWidth, inset: 2, frameRows: ruleRows(lines.length, sectionRows),
+  };
   if (cacheOwner) frameCache.set(cacheOwner, { title, source: source.slice(), width, palette, sections: sectionKey, frame });
   return frame;
 }
@@ -97,6 +112,8 @@ export function frameNativeRows(
   if (!margin) return frame;
   const cached = gutterFrames.get(frame);
   if (cached) return cached;
+  // Outer gutters are chrome on both sides, so the frame keeps the same line
+  // indices and the copy clamp widens by the margin on each side.
   const padded = { ...frame, inset: frame.inset + margin,
     lines: frame.lines.map((line) => isNativeImageRow(line) ? line : " ".repeat(margin) + line + " ".repeat(margin)),
   };
