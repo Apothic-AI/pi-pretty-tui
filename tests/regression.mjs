@@ -2710,6 +2710,40 @@ for (const name of ["find", "grep"]) {
   assert.equal(copyText(select(1, 2)), "first composer line\nsecond composer line");
 }
 
+// Chrome must track the geometry of the render the selection is on. A memoized
+// closure would clamp against the first width it saw.
+{
+  const copyText = (screen) => TuiAltScreen.prototype.getActiveSelectionText.call(screen);
+  await emit("session_start", {}, sessionContext([]));
+  const bubble = new UserMessageComponent("first selected line\nsecond selected line");
+  const frameBox = (component, lines, width) => {
+    const rect = { x: 0, y: 0, width, height: lines.length };
+    return {
+      previousScreen: lines, currentLayout: {
+        root: { component: {}, rect, clip: rect, layer: 0, children: [
+          { component, rect, clip: rect, layer: 0, children: [] },
+        ] },
+        width, height: lines.length, lines,
+      },
+      terminal: { rows: lines.length, columns: width },
+      getSelectionBounds: () => ({ start: { row: 1, col: 0 }, end: { row: 2, col: width } }),
+      getSelectionColumns: (line, row, selection) => ({
+        start: selection.start.row === row ? 0 : 0,
+        end: selection.end.row === row ? width : width,
+      }),
+    };
+  };
+  // Render wide, then narrow: the narrow render must clamp with its own inset.
+  const wide = bubble.render(100).map(stripTerminalSequences);
+  copyText(frameBox(bubble.children[0], wide, 100));
+  const narrow = bubble.render(40).map(stripTerminalSequences);
+  assert.notEqual(wide[1], narrow[1], "the two renders must differ for this check to mean anything");
+  const copied = copyText(frameBox(bubble.children[0], narrow, 40));
+  assert.equal(copied, "first selected line\nsecond selected line",
+    `clamp must follow the latest render, got ${JSON.stringify(copied)}`);
+}
+
+
 // Fullscreen Markdown shows per-block Copy controls with precise hit regions;
 // regular mode hides them and invalidation drops stale regions.
 {

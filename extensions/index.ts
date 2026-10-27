@@ -974,9 +974,6 @@ export default function prettyTui(pi: ExtensionAPI) {
         ? currentExtensionUi.theme.fg("mdHeading", text)
         : markdownTheme.heading(text);
       const userText = typeof this.text === "string" ? this.text : "";
-      // Clean mode draws its own frame, so the chrome depends on the measured
-      // body length; full/compact go through frameNativeRows and record theirs.
-      let cleanChrome: ((rowIndex: number) => any) | undefined;
       const frame: Component = {
         render(width: number): string[] {
           const measured = layout(width);
@@ -1003,7 +1000,10 @@ export default function prettyTui(pi: ExtensionAPI) {
           });
           // The rule rows and both gutters are chrome; the selection clamps to
           // the content between them, offset by the bubble's outer padding.
-          cleanChrome ??= (rowIndex: number) => {
+          // Rebuild the closure per render, never memoize it: it closes over the
+          // geometry of the width it was created for, and a re-render at another
+          // width (or after the text changed) would clamp against stale columns.
+          const cleanChrome = (rowIndex: number) => {
             if (rowIndex === 0 || rowIndex === measured.body.length + 1) return "frame";
             if (rowIndex > measured.body.length + 1) return undefined;
             return { left: measured.leftPad + 2, right: measured.rightPad + 2 };
