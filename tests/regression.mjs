@@ -14,7 +14,11 @@ import {
   initTheme,
   getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, TuiAltScreen, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { Markdown, ScrollView, Text, TuiAltScreen, VStack, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+// The suite runs in plain Node, where pi-tui's internal layout module is a
+// normal relative import. The extension itself cannot reach it through Pi's
+// module mapping, so it walks the layout tree structurally instead.
+import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
 import {
   ActivityTimeline,
   assistantTerminalState,
@@ -76,6 +80,7 @@ const protoPatchKeys = [
 
 const symbolPatchKeys = [
   ["TuiAltScreen", TuiAltScreen.prototype, Symbol.for("pretty-tui.clean-summary-click")],
+  ["TuiAltScreen", TuiAltScreen.prototype, Symbol.for("pretty-tui.selection-copy")],
 ].map(([label, owner, symbol]) => ({ label, owner, symbol }));
 
 const jiti = createJiti(import.meta.url);
@@ -2573,6 +2578,198 @@ for (const name of ["find", "grep"]) {
   assert.equal(copies.length, beforeRegular);
 }
 
+// Multi-line selection copies content, not the frame around it. Pi rebuilds
+// copied text from the rendered buffer, so a selection that spans a framed card
+// used to carry its gutters, corners, and section rules into the clipboard.
+{
+  const copyText = (screen) => TuiAltScreen.prototype.getActiveSelectionText.call(screen);
+  // A depth-first box walk like Pi's layout produces: one leaf per component.
+  const layoutFor = (components, lines, width) => {
+    let y = 0;
+    const boxes = components.map((entry) => {
+      const height = entry.lines.length;
+      const rect = { x: 0, y, width, height };
+      const box = { component: entry.component ?? { lines: entry.lines }, rect, clip: rect, layer: 0, children: [] };
+      y += height;
+      return box;
+    });
+    return {
+      layout: { root: { component: {}, rect: { x: 0, y: 0, width, height: y }, clip: { x: 0, y: 0, width, height: y }, layer: 0, children: boxes }, width, height: y, lines },
+    };
+  };
+  const selectionScreen = (lines, layout, start, end) => ({
+    previousScreen: lines,
+    currentLayout: layout,
+    terminal: { rows: lines.length, columns: 100 },
+    getSelectionBounds: () => ({ start, end }),
+    getSelectionColumns: (line, row) => {
+      const columns = TuiAltScreen.prototype.getSelectionColumns.call({
+        terminal: { columns: 100 },
+      }, line, row, { start, end });
+      return columns;
+    },
+  });
+
+  await emit("session_start", {}, sessionContext([]));
+  const message = new UserMessageComponent("first selected line\nsecond selected line\nthird stays out");
+  const rows = message.render(100).map(stripTerminalSequences);
+  assert.ok(rows[0].trimStart().startsWith("╭"), rows[0]);
+  // The component Pi lays out is the frame the bubble added, and that is the
+  // object the extension registers its chrome against.
+  const frameComponent = message.children[0];
+  assert.equal(typeof frameComponent.render, "function");
+  const { layout } = layoutFor([{ component: frameComponent, lines: rows }], rows, 100);
+  // Drag from inside the first body row to inside the second.
+  const bodyStart = rows.findIndex((line) => line.includes("first selected line"));
+  const bodyEnd = rows.findIndex((line) => line.includes("second selected line"));
+  assert.ok(bodyStart > 0 && bodyEnd > bodyStart);
+  const copy = copyText(selectionScreen(rows, layout,
+    { row: bodyStart, col: 2 }, { row: bodyEnd, col: rows[bodyEnd].indexOf("selected line") + "selected line".length }));
+  assert.ok(copy, "a selection inside the bubble must produce text");
+  assert.equal(copy, "first selected line\nsecond selected line",
+    `frame glyphs must not be copied: ${JSON.stringify(copy)}`);
+
+  // Selecting from the bubble's first row also drops the ╭…╮ rule.
+  // A selection that starts on the rule row drops the rule and keeps the text
+  // on the rows below it that the selection actually covers.
+  const fromTop = copyText(selectionScreen(rows, layout, { row: 0, col: 0 }, { row: bodyStart, col: rows[bodyStart].length }));
+  assert.equal(fromTop, "first selected line", `the top rule must not be copied: ${JSON.stringify(fromTop)}`);
+
+  // Selecting only frame rules copies nothing at all, rather than falling back
+  // to the frame-bearing text this fix exists to remove.
+  const rulesOnly = copyText(selectionScreen(rows, layout, { row: 0, col: 0 }, { row: 0, col: 60 }));
+  assert.equal(rulesOnly, undefined, "a rule-only selection must copy nothing");
+
+  // A genuine table column inside a message is content, not chrome.
+  const plain = { lines: ["| a | b |", "| c | d |"] };
+  const plainLayout = layoutFor([plain], plain.lines, 100).layout;
+  const tableCopy = copyText(selectionScreen(plain.lines, plainLayout,
+    { row: 0, col: 0 }, { row: 1, col: 9 }));
+  assert.equal(tableCopy, "| a | b |\n| c | d |", "content pipes must survive");
+}
+
+// The same clamp must work inside the transcript's scroll view, where copied
+// rows are content rows rather than screen rows: a content row has no rect, so
+// it has to be mapped to the screen row that draws it.
+{
+  const copyText = (screen) => TuiAltScreen.prototype.getActiveSelectionText.call(screen);
+  await emit("session_start", {}, sessionContext([]));
+  const bubble = new UserMessageComponent("first selected line\nsecond selected line");
+  const scrollView = new ScrollView(new VStack([bubble]), { scrollbar: "hidden", primary: true });
+  const frame = renderLayoutFrame(new VStack([scrollView]), 100, 8, () => {});
+  const content = frame.root.children[0].scrollContentLines;
+  assert.equal(content.length, 4, "one rule, two body rows, one rule");
+  const select = (start, end) => ({
+    previousScreen: frame.lines, currentLayout: frame, terminal: { rows: 8, columns: 100 },
+    getSelectionBounds: () => ({
+      start: { row: start, col: 0, scrollView }, end: { row: end, col: 100, scrollView },
+    }),
+    getSelectionColumns: (line, row, selection) => ({
+      start: selection.start.row === row ? selection.start.col : 0,
+      end: selection.end.row === row ? selection.end.col : 100,
+    }),
+  });
+  // Rows 1..2 are the card's body; the rules at 0 and 3 are excluded either by
+  // the selection bounds or by the chrome clamp.
+  assert.equal(copyText(select(1, 2)), "first selected line\nsecond selected line");
+  // A selection that spans the rules drops them.
+  assert.equal(copyText(select(0, 3)), "first selected line\nsecond selected line");
+  // A rule-only selection copies nothing instead of the frame.
+  assert.equal(copyText(select(0, 0)), undefined);
+}
+
+// Tool cards carry their frame the same way, and register it on the component
+// Pi lays out (the tool execution component itself).
+{
+  const copyText = (screen) => TuiAltScreen.prototype.getActiveSelectionText.call(screen);
+  const projection = await jiti.import(join(process.cwd(), "extensions/tool-presentation.ts"));
+  const owner = {
+    toolName: "bash", toolCallId: "selection-card", args: { command: "echo hello" },
+    result: { content: [{ type: "text", text: "hello" }], isError: false },
+    isPartial: false, expanded: false, outputPad: 1, state: {},
+    toolDefinition: { renderShell: "self", label: "bash" },
+  };
+  // Render lazily, as Pi does each frame, so chrome is recorded on render.
+  owner.render = function () {
+    return projection.renderToolProjection(owner, 100, theme, {
+      mode: "full", nested: { count: () => 0 }, nestedExpanded: false,
+      renderNative: () => ["$ echo hello", "hello"],
+    }).lines;
+  };
+  const rows = owner.render().map(stripTerminalSequences);
+  assert.ok(rows[0].includes("╭─ bash"), rows[0]);
+  const frame = renderLayoutFrame(new VStack([owner]), 100, rows.length, () => {});
+  const select = (start, end) => ({
+    previousScreen: frame.lines, currentLayout: frame, terminal: { rows: rows.length, columns: 100 },
+    getSelectionBounds: () => ({ start: { row: start, col: 0 }, end: { row: end, col: 100 } }),
+    getSelectionColumns: (line, row, selection) => ({
+      start: selection.start.row === row ? selection.start.col : 0,
+      end: selection.end.row === row ? selection.end.col : 100,
+    }),
+  });
+  assert.equal(copyText(select(0, rows.length - 1)), "$ echo hello\nhello");
+  assert.equal(copyText(select(0, 0)), undefined, "a card rule must copy nothing");
+}
+
+// The prompt composer frames the native editor with a gutter on each side. A
+// multi-line selection inside it must copy the typed lines only.
+{
+  const copyText = (screen) => TuiAltScreen.prototype.getActiveSelectionText.call(screen);
+  const tui = { requestRender() {}, terminal: { rows: 24, columns: 80 } };
+  const editor = new CustomEditor(tui, "> ", "Type...", [], theme, {});
+  editor.borderColor = (text) => text;
+  editor.setText("first composer line\nsecond composer line");
+  const rows = editor.render(80).map(stripTerminalSequences);
+  assert.ok(rows[0].startsWith("╭"), rows[0]);
+  const frame = renderLayoutFrame(new VStack([editor]), 80, rows.length, () => {});
+  const select = (start, end) => ({
+    previousScreen: frame.lines, currentLayout: frame, terminal: { rows: rows.length, columns: 80 },
+    getSelectionBounds: () => ({ start: { row: start, col: 0 }, end: { row: end, col: 80 } }),
+    getSelectionColumns: (line, row, selection) => ({
+      start: selection.start.row === row ? selection.start.col : 0,
+      end: selection.end.row === row ? selection.end.col : 80,
+    }),
+  });
+  // Whole frame: rules dropped, gutters stripped on both sides.
+  assert.equal(copyText(select(0, rows.length - 1)), "first composer line\nsecond composer line");
+  // A drag between the two body rows keeps both, and no gutter.
+  assert.equal(copyText(select(1, 2)), "first composer line\nsecond composer line");
+}
+
+// Chrome must track the geometry of the render the selection is on. A memoized
+// closure would clamp against the first width it saw.
+{
+  const copyText = (screen) => TuiAltScreen.prototype.getActiveSelectionText.call(screen);
+  await emit("session_start", {}, sessionContext([]));
+  const bubble = new UserMessageComponent("first selected line\nsecond selected line");
+  const frameBox = (component, lines, width) => {
+    const rect = { x: 0, y: 0, width, height: lines.length };
+    return {
+      previousScreen: lines, currentLayout: {
+        root: { component: {}, rect, clip: rect, layer: 0, children: [
+          { component, rect, clip: rect, layer: 0, children: [] },
+        ] },
+        width, height: lines.length, lines,
+      },
+      terminal: { rows: lines.length, columns: width },
+      getSelectionBounds: () => ({ start: { row: 1, col: 0 }, end: { row: 2, col: width } }),
+      getSelectionColumns: (line, row, selection) => ({
+        start: selection.start.row === row ? 0 : 0,
+        end: selection.end.row === row ? width : width,
+      }),
+    };
+  };
+  // Render wide, then narrow: the narrow render must clamp with its own inset.
+  const wide = bubble.render(100).map(stripTerminalSequences);
+  copyText(frameBox(bubble.children[0], wide, 100));
+  const narrow = bubble.render(40).map(stripTerminalSequences);
+  assert.notEqual(wide[1], narrow[1], "the two renders must differ for this check to mean anything");
+  const copied = copyText(frameBox(bubble.children[0], narrow, 40));
+  assert.equal(copied, "first selected line\nsecond selected line",
+    `clamp must follow the latest render, got ${JSON.stringify(copied)}`);
+}
+
+
 // Fullscreen Markdown shows per-block Copy controls with precise hit regions;
 // regular mode hides them and invalidation drops stale regions.
 {
@@ -2886,6 +3083,7 @@ for (const name of ["find", "grep"]) {
 }
 
 const patchedSelectionHandler = TuiAltScreen.prototype.handleSelectionMouseEvent;
+const patchedSelectionCopy = TuiAltScreen.prototype.getActiveSelectionText;
 const patchedMarkdownRenderToken = Markdown.prototype.renderToken;
 const patchedAssistantRender = AssistantMessageComponent.prototype.render;
 const patchedAssistantMouse = AssistantMessageComponent.prototype.handleMouse;
@@ -4085,6 +4283,7 @@ assert.notEqual(CustomMessageComponent.prototype.render, patchedCustomMessageRen
 assert.notEqual(ToolExecutionComponent.prototype.render, patchedToolRender);
 assert.notEqual(InteractiveMode.prototype.showExtensionNotify, patchedShowExtensionNotify);
 assert.notEqual(TuiAltScreen.prototype.handleSelectionMouseEvent, patchedSelectionHandler);
+assert.notEqual(TuiAltScreen.prototype.getActiveSelectionText, patchedSelectionCopy);
 
 // Disabled startup keeps only the settings command: no tools, event handlers,
 // or prototype patches are installed. The command can persist re-enabling.

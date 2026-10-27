@@ -1,5 +1,7 @@
 import { isNativeImageRow } from "./ansi-style.js";
 import { cardMargin, cardBackground, frameNativeRows, nativeFrameWidth } from "./full-frame.js";
+import { chromeFromFrame, registerSelectionChrome, stackedChrome } from "./selection-chrome.js";
+import { selectionText } from "./selection-copy.js";
 import { ThoughtPresentation } from "./thought-presentation.js";
 import { isThirdPartyTool, renderToolProjection, toolLabel, type ToolProjection } from "./tool-presentation.js";
 import { NestedTools, NESTED_SNAPSHOT_ENTRY } from "./nested-tools.js";
@@ -831,7 +833,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const fitInnerWidth = (line: string) =>
         line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
 
-      return lines.map((line, index) => {
+      const rendered = lines.map((line, index) => {
         const fitted = fitInnerWidth(line);
         if (index === 0) return this.borderColor("╭") + fitted + this.borderColor("╮");
         if (index === bottomBorderIndex) return this.borderColor("╰") + fitted + this.borderColor("╯");
@@ -839,6 +841,13 @@ export default function prettyTui(pi: ExtensionAPI) {
         // Autocomplete remains outside the input frame, aligned to its content.
         return " " + fitted + " ";
       });
+      // The composer frame is chrome on every row, including the rule rows.
+      registerSelectionChrome(this, (rowIndex) => {
+        if (rowIndex < 0 || rowIndex >= rendered.length) return undefined;
+        if (rowIndex === 0 || rowIndex >= bottomBorderIndex) return "frame";
+        return { left: 1, right: 1 };
+      });
+      return rendered;
     };
     const patchedEditorHandleMouse = function (this: any, event: any) {
       if (event.width < 3) return originalEditorHandleMouse.call(this, event);
@@ -899,6 +908,9 @@ export default function prettyTui(pi: ExtensionAPI) {
       originalUserMessageRebuild.call(this);
       const content = this.children?.[0] as any;
       if (!content) return;
+      // Pi lays out the message component, not the frame wrapper it creates, so
+      // chrome the frame records has to be reachable from the message too.
+      const messageOwner = this;
 
       // Remove Pi's full-width user-message background. The Markdown keeps its
       // native foreground styling, while the surrounding bubble stays transparent.
@@ -993,8 +1005,12 @@ export default function prettyTui(pi: ExtensionAPI) {
               ? cardBackground(line, width, defaultActivityTheme(), "toolPendingBg", "mdHeading") : left + line + right);
           }
           if (renderMode !== "clean") {
-            return frameNativeRows("User", measured.body, width, defaultActivityTheme(), undefined,
-              frame, "mdHeading", "", "mdHeading").lines;
+            const native = frameNativeRows("User", measured.body, width, defaultActivityTheme(), undefined,
+              frame, "mdHeading", "", "mdHeading");
+            const chrome = chromeFromFrame(native);
+            registerSelectionChrome(frame, chrome);
+            registerSelectionChrome(messageOwner, chrome);
+            return native.lines;
           }
 
           const top = border("╭" + "─".repeat(Math.max(0, measured.frameWidth - 2)) + "╮");
@@ -1003,6 +1019,18 @@ export default function prettyTui(pi: ExtensionAPI) {
             const padding = " ".repeat(Math.max(0, measured.contentWidth - visibleWidth(line)));
             return border("│ ") + line + padding + border(" │");
           });
+          // The rule rows and both gutters are chrome; the selection clamps to
+          // the content between them, offset by the bubble's outer padding.
+          // Rebuild the closure per render, never memoize it: it closes over the
+          // geometry of the width it was created for, and a re-render at another
+          // width (or after the text changed) would clamp against stale columns.
+          const cleanChrome = (rowIndex: number) => {
+            if (rowIndex === 0 || rowIndex === measured.body.length + 1) return "frame";
+            if (rowIndex > measured.body.length + 1) return undefined;
+            return { left: measured.leftPad + 2, right: measured.rightPad + 2 };
+          };
+          registerSelectionChrome(frame, cleanChrome);
+          registerSelectionChrome(messageOwner, cleanChrome);
           return [top, ...body, bottom].map((line: string) => left + line + right);
         },
         handleMouse(event: any) {
@@ -1219,6 +1247,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const frame = frameNativeRows(`compaction ${this.expanded ? "▾" : "▸"}`, source, width, theme,
         undefined, this, "customMessageLabel", "", "customMessageLabel", "customMessageBg");
       views.set(this, { width: innerWidth, sourceOffset, frame });
+      registerSelectionChrome(this, chromeFromFrame(frame));
       mouseClickHitTests.set(this, (event) => event.y === 0 || frame.sourceRows.has(event.y));
       return frame.lines.map((line) => isNativeImageRow(line) ? line : truncateToWidth(line, Math.max(1, width), ""));
     };
@@ -1320,6 +1349,9 @@ export default function prettyTui(pi: ExtensionAPI) {
       const nativeLines = originalRender.call(this, innerWidth);
       const rows = new Map<number, { sourceY: number; inset: number }>();
       const thoughtRows = new Set<number>();
+      // Rows contributed to the copy clamp, in render order. Non-framed
+      // children contribute content-only rows with no chrome.
+      const panelChrome: { rows: number; chrome?: ReturnType<typeof chromeFromFrame> }[] = [];
       const output: string[] = [];
       const children = this.contentContainer.children;
       let sourceY = 0;
@@ -1361,6 +1393,7 @@ export default function prettyTui(pi: ExtensionAPI) {
           const baseLabel = isThought ? this.isStreaming ? "thinking" : "thought" : "Assistant";
           const label = isThought && renderMode === "compact" ? `${baseLabel} ${hidden ? "▸" : "▾"}` : baseLabel;
           const frame = frameNativeRows(label, source, width, defaultActivityTheme(), undefined, child, role, "", role);
+          panelChrome.push({ rows: frame.lines.length, chrome: chromeFromFrame(frame) });
           for (const [y, nativeY] of frame.sourceRows) {
             rows.set(output.length + y, { sourceY: sourceY + nativeY, inset: frame.inset });
             if (isThought) thoughtRows.add(output.length + y);
@@ -1373,6 +1406,7 @@ export default function prettyTui(pi: ExtensionAPI) {
           sourceY += height;
         } else {
           for (let y = 0; y < childLines.length; y++) rows.set(output.length + y, { sourceY: sourceY + y, inset: 0 });
+          panelChrome.push({ rows: childLines.length });
           output.push(...nativeLines.slice(sourceY, sourceY + childLines.length));
           sourceY += childLines.length;
         }
@@ -1382,6 +1416,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         if (terminal) output.push(...renderPendingActivityUpdate(terminal, width, this));
       }
       panelAssistantViews.set(this, { rows, width: innerWidth, height: nativeLines.length });
+      registerSelectionChrome(this, stackedChrome(panelChrome));
       mouseClickHitTests.set(this, (event) => thoughtRows.has(event.y));
       return renderMode === "compact" && width < 8
         ? output.map((line) => isNativeImageRow(line) ? line : truncateToWidth(line, Math.max(1, width), "")) : output;
@@ -2271,6 +2306,37 @@ export default function prettyTui(pi: ExtensionAPI) {
         altScreenPrototype.handleMouseEvent === patch.originalHandleMouseEvent
       ) {
         delete altScreenPrototype[cleanSummaryClickPatchKey];
+      }
+    });
+  }
+
+  // Copying a selection must not carry our frames into the clipboard. Pi builds
+  // copied text from the rendered buffer, so clamp it to the chrome recorded by
+  // the renderers above. Patching the instance method (not the prototype) keeps
+  // the host's own copy path intact for every screen without our chrome.
+  const selectionCopyPatchKey = Symbol.for("pretty-tui.selection-copy");
+  {
+    const originalGetActiveSelectionText = altScreenPrototype.getActiveSelectionText;
+    // Fall back to Pi's own routine whenever this screen has no chrome to
+    // clamp (no layout, no selection, or only unframed rows).
+    const patchedGetActiveSelectionText = function (this: any) {
+      const copy = selectionText(this);
+      if (!copy.applied) return originalGetActiveSelectionText.call(this);
+      return copy.text ? copy.text : undefined;
+    };
+    altScreenPrototype[selectionCopyPatchKey] = {
+      originalGetActiveSelectionText,
+      patchedGetActiveSelectionText,
+    };
+    altScreenPrototype.getActiveSelectionText = patchedGetActiveSelectionText;
+
+    pi.on("session_shutdown", () => {
+      const patch = altScreenPrototype[selectionCopyPatchKey];
+      if (patch?.patchedGetActiveSelectionText === altScreenPrototype.getActiveSelectionText) {
+        altScreenPrototype.getActiveSelectionText = patch.originalGetActiveSelectionText;
+      }
+      if (patch && altScreenPrototype.getActiveSelectionText === patch.originalGetActiveSelectionText) {
+        delete altScreenPrototype[selectionCopyPatchKey];
       }
     });
   }
