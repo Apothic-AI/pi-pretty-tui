@@ -82,6 +82,7 @@ const jiti = createJiti(import.meta.url);
 const extension = await jiti.import(join(process.cwd(), "extensions/index.ts"), { default: true });
 const handlers = new Map();
 const tools = new Map();
+const toolRenderers = [];
 const commands = new Map();
 const entryRenderers = new Map();
 const appendedEntries = [];
@@ -96,6 +97,31 @@ const pi = {
   registerCommand(name, command) { commands.set(name, command); },
   registerEntryRenderer(type, renderer) { entryRenderers.set(type, renderer); },
   registerTool(tool) { tools.set(tool.name, tool); },
+  registerToolRenderer(resolver) { toolRenderers.push(resolver); },
+};
+// Mirror Pi's resolver chain: resolvers run in extension load order and next()
+// reaches the remaining resolvers, then the tool's own renderers. Pretty-tui
+// registers render-only, so a test that wants its drawing must resolve the
+// declared tool's renderers through this chain, not read them off `tools`.
+const resolveToolRenderers = (name) => {
+  const base = () => tools.get(name);
+  const resolve = (index) => index < toolRenderers.length
+    ? toolRenderers[index](name, () => resolve(index + 1)) : base();
+  return resolve(0);
+};
+// Reading a tool the way Pi's host does: schema and description come from the
+// declared definition, drawing comes from the resolved renderer chain.
+const renderedTool = (name) => {
+  const declared = tools.get(name) ?? {};
+  const renderers = resolveToolRenderers(name) ?? {};
+  return { ...declared, ...renderers };
+};
+// Resolve the chain over an explicit base definition, as Pi's host does when a
+// registration owns the tool name and renderers are asked for separately.
+const resolveOver = (name, base) => {
+  const resolve = (index) => index < toolRenderers.length
+    ? toolRenderers[index](name, () => resolve(index + 1)) : base;
+  return resolve(0);
 };
 extension(pi);
 
@@ -204,8 +230,8 @@ const renderCollapsedSummaries = async (entries) => {
     const entry = entries[entryIndex];
     if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
     for (const item of entry.message.content ?? []) {
-      if (item.type !== "toolCall" || !tools.has(item.name)) continue;
-      const component = tools.get(item.name).renderCall(item.arguments, theme, {
+      if (item.type !== "toolCall" || !renderedTool(item.name).renderCall) continue;
+      const component = renderedTool(item.name).renderCall(item.arguments, theme, {
         toolCallId: item.id,
         expanded: false,
         executionStarted: true,
@@ -234,7 +260,7 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   ];
   for (const [name, args] of fixtures) {
     colors.length = 0;
-    const component = tools.get(name).renderCall(args, parameterTheme, {
+    const component = renderedTool(name).renderCall(args, parameterTheme, {
       toolCallId: `parameter-color-${name}`, expanded: true, executionStarted: true, state: {},
     });
     component.render(100);
@@ -268,7 +294,7 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   ];
   for (const [range, suffix] of fixtures) {
     const args = Object.freeze({ path: "range-fixture.ts", ...range });
-    const component = tools.get("read").renderCall(args, theme, {
+    const component = renderedTool("read").renderCall(args, theme, {
       toolCallId: "read-range-fixture", expanded: true, executionStarted: true, state: {},
     });
     const output = stripTerminalSequences(component.render(120).join("\n")).trim();
@@ -290,7 +316,7 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const renderEdit = (width, expanded = true, isError = false, details = { diff }) => {
     const colors = [];
     const editTheme = { ...theme, fg(color, text) { colors.push([color, text]); return text; } };
-    const component = tools.get("edit").renderResult(
+    const component = renderedTool("edit").renderResult(
       { content: [{ type: "text", text: isError ? "Edit failed: original text not found" : "Updated" }], details },
       { expanded, isPartial: false }, editTheme,
       { toolCallId: "edit-gutter-fixture", executionStarted: true, isError, state: {} },
@@ -1280,7 +1306,7 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
 // "Error:" must still render as a success.
 {
   await emit("session_start", {}, sessionContext([]));
-  const bashTool = tools.get("bash");
+  const bashTool = renderedTool("bash");
   const renderBashResult = (text, isError) => {
     const context = {
       toolCallId: "bash-output-text",
@@ -3418,7 +3444,7 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
   const components = [];
   const render = (tool, width = 100) => tool.render(width).map(stripTerminalSequences);
   for (const [name, args, output, details] of definitions) {
-    const tool = new ToolExecutionComponent(name, `compact-panel-${name}`, args, undefined, tools.get(name), { requestRender() {} }, process.cwd());
+    const tool = new ToolExecutionComponent(name, `compact-panel-${name}`, args, undefined, renderedTool(name), { requestRender() {} }, process.cwd());
     tool.updateResult({ content: [{ type: "text", text: output }], details, isError: false, durationMs: 1200 });
     components.push(tool);
     const collapsed = render(tool);
@@ -3447,7 +3473,7 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
     for (const width of [8, 12, 40]) assert.ok(render(tool, width).every((line) => visibleWidth(line) <= width));
   }
   const longCommand = 'rg -n "accent" extensions/full-frame.ts extensions/tool-presentation.ts; rg -n "title|accent|success" tests/regression.mjs | tail -12';
-  const wrappedBash = new ToolExecutionComponent("bash", "compact-wrapped-bash", { command: longCommand }, undefined, tools.get("bash"), { requestRender() {} }, process.cwd());
+  const wrappedBash = new ToolExecutionComponent("bash", "compact-wrapped-bash", { command: longCommand }, undefined, renderedTool("bash"), { requestRender() {} }, process.cwd());
   wrappedBash.updateResult({ content: [{ type: "text", text: "Done" }], isError: false });
   for (const width of [40, 80, 100]) {
     const rows = render(wrappedBash, width);
@@ -3516,7 +3542,7 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
   ];
   for (const [name, factory, args, text, details] of cases) {
     const nativeDefinition = factory(process.cwd());
-    const tool = new ToolExecutionComponent(name, `full-card-${name}`, args, undefined, tools.get(name), { requestRender() {} }, process.cwd());
+    const tool = new ToolExecutionComponent(name, `full-card-${name}`, args, undefined, renderedTool(name), { requestRender() {} }, process.cwd());
     const baseline = new ToolExecutionComponent(name, `native-card-${name}`, args, undefined, nativeDefinition, { requestRender() {} }, process.cwd());
     const toolResult = { content: [{ type: "text", text }], details, isError: false, durationMs: 1234 };
     tool.updateResult(toolResult); baseline.updateResult(toolResult);
@@ -3574,7 +3600,7 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
     'fi',
   ].join("\n");
   const shellArgs = Object.freeze({ command: shellSource, timeout: 12 });
-  const highlightedShell = new ToolExecutionComponent("bash", "full-shell-colors", shellArgs, undefined, tools.get("bash"), { requestRender() {} }, process.cwd());
+  const highlightedShell = new ToolExecutionComponent("bash", "full-shell-colors", shellArgs, undefined, renderedTool("bash"), { requestRender() {} }, process.cwd());
   highlightedShell.render(100);
   const callText = highlightedShell.callRendererComponent.text;
   assert.equal(stripTerminalSequences(callText), `$ ${shellSource} (timeout 12s)`, "highlighting preserves native prompt, command, whitespace and timeout");
@@ -3618,7 +3644,7 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
   const realClock = Date.now;
   let timerNow = 5000;
   Date.now = () => timerNow;
-  const timed = new ToolExecutionComponent("bash", "full-border-timer", { command: "echo timer" }, undefined, tools.get("bash"), { requestRender() {} }, process.cwd());
+  const timed = new ToolExecutionComponent("bash", "full-border-timer", { command: "echo timer" }, undefined, renderedTool("bash"), { requestRender() {} }, process.cwd());
   try {
     timed.markExecutionStarted();
     timerNow = 7000;
@@ -4078,8 +4104,7 @@ assert.notEqual(TuiAltScreen.prototype.handleSelectionMouseEvent, patchedSelecti
   });
   assert.deepEqual(disabledHandlers, []);
   assert.deepEqual(disabledTools, []);
-  assert.ok(disabledCommands.has("pretty-tui"));
-  const notices = [];
+  assert.ok(disabledCommands.has("pretty-tui"));  const notices = [];
   let reloads = 0;
   await disabledCommands.get("pretty-tui").handler("enable", {
     hasUI: true,
@@ -4091,6 +4116,39 @@ assert.notEqual(TuiAltScreen.prototype.handleSelectionMouseEvent, patchedSelecti
   assert.ok(notices.at(-1)[0].includes("reloading"));
   rmSync(disabledAgentDir, { recursive: true, force: true });
   process.env.PI_CODING_AGENT_DIR = agentDir;
+}
+
+// Render-only registration must not claim a tool name. Pi allows one owner per
+// name and fails the losing extension, so a bash-owning extension (for example
+// a background-task extension) has to keep the name and its schema. Pretty-tui
+// supplies drawing only, through the resolver chain.
+{
+  assert.deepEqual([...tools.keys()], [], "pretty-tui must not register a tool name");
+  assert.ok(toolRenderers.length > 0, "pretty-tui must register tool renderers");
+  const owner = {
+    name: "bash",
+    label: "bash",
+    description: "owner schema",
+    parameters: { type: "object" },
+    runInBackground: true,
+    renderCall: () => new Text("owner call", 0, 0),
+  };
+  // Resolve the chain over a base that supplies the owning extension's
+  // definition, exactly as Pi's host does for a registered tool.
+  const resolved = resolveOver("bash", owner);
+  assert.ok(resolved, "resolving bash must still yield a definition");
+  assert.equal(resolved.description, "owner schema", "owner schema must survive");
+  assert.equal(resolved.runInBackground, true, "owner fields must survive");
+  assert.equal(resolved.label, "bash", "owner label must survive");
+  assert.notEqual(resolved.renderCall, owner.renderCall, "pretty-tui must supply the drawing");
+  const rendered = resolved.renderCall(
+    { command: "echo render-only" }, theme,
+    { toolCallId: "render-only-bash", expanded: true, executionStarted: true, state: {} },
+  ).render(100).join("\n");
+  assert.ok(stripTerminalSequences(rendered).includes("echo render-only"), rendered);
+  // A tool pretty-tui does not draw keeps whatever the chain had before it.
+  const untouched = resolveOver("unlisted", { name: "unlisted", renderCall: () => "kept" });
+  assert.equal(untouched.renderCall(), "kept", "an unlisted tool must keep its renderers");
 }
 
 rmSync(agentDir, { recursive: true, force: true });
