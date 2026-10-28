@@ -1,93 +1,62 @@
 /**
  * Copying a selection must yield content, not the frame drawn around it.
  *
- * Pi builds copied text from the rendered screen buffer: `TuiAltScreen` walks
- * the selected rows, slices each by column, strips escape sequences, and joins
- * with newlines. Border glyphs are ordinary buffer characters, so a selection
- * that crosses a framed card copies `│ … │` gutters, and one that reaches a
- * card's first or last row copies the `╭…╮` / `╰…╯` rule itself.
+ * Pi rebuilds copied text from the rendered screen buffer, so a selection that
+ * crosses a framed card carries the frame into the clipboard:
  *
- * Pi's copy path has no seam for a renderer to declare its chrome, so this
- * extension records the geometry it already computes while rendering:
+ *     ╭─────────────────────────╮
+ *     │ This is a test message. │
+ *     ╰─────────────────────────╯
  *
- * - a row that is pure frame (a rule, or a section divider);
- * - how many columns of a row are chrome on each side.
+ * Pi exposes no seam for a renderer to declare its chrome, and the copy method
+ * is private. Mapping copied rows back to the components that drew them is not
+ * an option either: in fullscreen mode Pi's laid-out leaves are `Container`
+ * wrappers, not the message components an extension can get a handle on.
  *
- * Geometry is registered against the component Pi lays out, so the copy path
- * resolves a screen row to the component that drew it and clamps only there. A
- * `│` that is genuinely content — a Markdown table inside a message — sits
- * inside the clamp and survives.
+ * So this trims each copied line by what it contains. That is sound because Pi
+ * never puts box-drawing characters in prose — Markdown tables render as real
+ * boxes (`┌─┬─┐`, `│ a │ b │`, `├─┼─┤`) — so a `│` or `─` on a copied line is
+ * always frame or table art, never text the user meant to copy. A line that is
+ * nothing but art (a rule, or a table separator) is dropped rather than copied
+ * as a blank line, so selecting a whole card yields just its text.
  */
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 
-/** What one rendered row contributes to a copy. */
-export type RowChrome =
-  /** Chrome only: copying skips the row. */
-  | "frame"
-  /** Content between `left` and `width - right`; those columns are chrome. */
-  | { left: number; right: number };
+// Frame and table art: rounded and square box sets plus the rule glyphs.
+const ART = "│┃║┌┐└┘├┤┬┴┼╭╮╰╯╔╗╚╝╠╣╦╩╬─━═";
+const ART_CHARS = new RegExp(`[${ART}]`, "u");
+const ART_ONLY = new RegExp(`^[\\s${ART}]+$`, "u");
+// A gutter is the art glyph plus the single padding space that follows or
+// precedes it, which is how the frame renders `│ content │`.
+const LEADING_GUTTER = new RegExp(`^[\\s]*[${ART}][\\s]`, "u");
+const TRAILING_GUTTER = new RegExp(`[\\s][${ART}][\\s]*$`, "u");
+const ANY_ART = new RegExp(`[${ART}]`, "gu");
+// A rule row is a whole horizontal border, corner to corner. It may carry a
+// title (`╭─ bash ───╮`) or a table separator's junctions, but it is chrome
+// either way: the title is a label for the frame, not content of the copy.
+const RULE_ROW = new RegExp(`^[\\s]*[╭╰├┌└╔╚╠][^\\n]*[╮╯┤┐┘╗╝╣][\\s]*$`, "u");
 
-export type SelectionChrome = (rowIndex: number) => RowChrome | undefined;
-
-const registry = new WeakMap<object, SelectionChrome>();
-
-/** Record the chrome of a component's rendered rows. */
-export const registerSelectionChrome = (component: object, chrome: SelectionChrome): void => {
-  registry.set(component, chrome);
+/** Remove frame art from one copied line, or undefined if it was pure art. */
+export const stripFrame = (line: string): string | undefined => {
+  const plain = stripTerminalSequences(line);
+  if (!ART_CHARS.test(plain)) return plain.replace(/\s+$/u, "");
+  // Drop whole rule rows, including any title they carry.
+  if (ART_ONLY.test(plain) || RULE_ROW.test(plain)) return undefined;
+  const trimmed = plain
+    .replace(LEADING_GUTTER, "")
+    .replace(TRAILING_GUTTER, "")
+    .replace(ANY_ART, "")
+    .replace(/\s+$/u, "");
+  return ART_ONLY.test(trimmed) ? undefined : trimmed;
 };
 
-export const selectionChromeOf = (component: object | undefined): SelectionChrome | undefined =>
-  component ? registry.get(component) : undefined;
-
-/** Chrome rows for a frame: its rules are chrome, its body rows are inset. */
-export const frameChrome = (
-  rows: number, frames: ReadonlySet<number>, inset: number,
-): SelectionChrome => (rowIndex) => {
-  if (rowIndex < 0 || rowIndex >= rows) return undefined;
-  return frames.has(rowIndex) ? "frame" : { left: inset, right: inset };
-};
-
-/**
- * Chrome for a component that stacks several rendered chunks: `spans` lists the
- * number of rows each chunk contributed, in order, with the chrome to use for
- * it. Rows past the last span are free content.
- */
-export const stackedChrome = (
-  spans: readonly { rows: number; chrome?: SelectionChrome }[],
-): SelectionChrome => {
-  const starts: number[] = [];
-  let total = 0;
-  for (const span of spans) {
-    starts.push(total);
-    total += span.rows;
+/** Rebuild copied text the way Pi does, with frame art removed. */
+export const selectionText = (text: string): string | undefined => {
+  const lines: string[] = [];
+  for (const line of text.split("\n")) {
+    const kept = stripFrame(line);
+    if (kept !== undefined) lines.push(kept);
   }
-  return (rowIndex) => {
-    if (rowIndex < 0) return undefined;
-    for (let i = spans.length - 1; i >= 0; i--) {
-      if (rowIndex >= starts[i]) {
-        const row = rowIndex - starts[i];
-        return row < spans[i].rows ? spans[i].chrome?.(row) : undefined;
-      }
-    }
-    return undefined;
-  };
-};
-
-/** Row indices of the rules a frame renderer produced. */
-export const ruleRows = (lineCount: number, dividers: Iterable<number>): Set<number> => {
-  const rows = new Set<number>(dividers);
-  if (lineCount > 0) rows.add(0);
-  if (lineCount > 1) rows.add(lineCount - 1);
-  return rows;
-};
-
-/**
- * Chrome for a component whose rendered rows are one frame. `offset` covers
- * renderers that prepend rows before the frame.
- */
-export const chromeFromFrame = (
-  frame: { frameRows: ReadonlySet<number>; inset: number; lines: readonly string[] }, offset = 0,
-): SelectionChrome => (rowIndex) => {
-  const y = rowIndex - offset;
-  if (y < 0 || y >= frame.lines.length) return undefined;
-  return frame.frameRows.has(y) ? "frame" : { left: frame.inset, right: frame.inset };
+  const result = lines.join("\n");
+  return result.trim().length === 0 ? undefined : result;
 };

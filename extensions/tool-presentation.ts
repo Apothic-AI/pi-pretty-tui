@@ -1,7 +1,6 @@
 import { highlightNativeShellCall } from "./shell-highlight.js";
 import { isNativeImageRow, stripAnsiBackgrounds } from "./ansi-style.js";
 import { cardMargin, frameNativeRows, frameNativeToolRows, nativeFrameWidth } from "./full-frame.js";
-import { chromeFromFrame, registerSelectionChrome } from "./selection-chrome.js";
 import { Spacer, Text, sliceByColumn, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { NestedTools } from "./nested-tools.js";
 
@@ -173,7 +172,6 @@ function renderToolContent(
     );
     const sourceRows = new Map([...frame.sourceRows].map(([y, original]) => [y, sourceIndexes[original]]));
     if (timer) sourceRows.set(frame.lines.length - 1, timer.start);
-    registerSelectionChrome(owner, chromeFromFrame(frame));
     return {
       lines: frame.lines, actions, toggleRows, sourceRows,
       native: { x: frame.inset, y: 0, width: innerWidth, height: nativeLines.length, sourceY: 0 },
@@ -283,7 +281,6 @@ export function renderToolProjection(
   }
   if (!options.nested.count(owner.toolCallId)) toggleRows.add(0);
   const lines = width < 8 ? frame.lines.map((line) => isNativeImageRow(line) ? line : truncateToWidth(line, Math.max(1, width), "")) : frame.lines;
-  registerSelectionChrome(owner, chromeFromFrame(frame));
   return { lines, actions, toggleRows, sourceRows: native ? sourceRows : undefined,
     native: native ? { ...native, x: frame.inset + native.x, y: 0 } : undefined };
 }

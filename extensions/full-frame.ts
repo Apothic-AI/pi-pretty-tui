@@ -1,12 +1,9 @@
 import { cardSurface } from "./card-surface.js";
 import { isNativeImageRow, stripAnsiBackgrounds } from "./ansi-style.js";
-import { ruleRows } from "./selection-chrome.js";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 export type NativeFrame = {
   lines: string[]; sourceRows: Map<number, number>; contentWidth: number; inset: number;
-  /** Rows that are pure frame; copying must skip them entirely. */
-  frameRows: Set<number>;
 };
 const frameCache = new WeakMap<object, {
   title: string; source: string[]; width: number; palette: string; sections: string; frame: NativeFrame;
@@ -57,7 +54,7 @@ function renderPanel(
     source.forEach((_, y) => sourceRows.set(y, y));
     return {
       lines: source.map((row) => cardBackground(row, width, theme, background, borderColor)),
-      sourceRows, contentWidth: Math.max(1, width), inset: 0, frameRows: new Set<number>(),
+      sourceRows, contentWidth: Math.max(1, width), inset: 0,
     };
   }
   const contentWidth = width - 4;
@@ -84,16 +81,7 @@ function renderPanel(
   lines.push(footerFits
     ? border("╰" + "─".repeat(width - visibleWidth(footer) - 5) + " " + footer + " ─╯")
     : border("╰" + "─".repeat(width - 2) + "╯"));
-  const sectionRows = new Set<number>();
-  // Sections push a divider before their first content row; recover those rows
-  // from the finished line list so the set matches `lines` exactly.
-  for (let y = 1; y < lines.length - 1; y++) {
-    if (stripTerminalSequences(lines[y]).startsWith("├")) sectionRows.add(y);
-  }
-  const frame = {
-    lines: lines.map((line) => cardBackground(line, width, theme, background, borderColor)),
-    sourceRows, contentWidth, inset: 2, frameRows: ruleRows(lines.length, sectionRows),
-  };
+  const frame = { lines: lines.map((line) => cardBackground(line, width, theme, background, borderColor)), sourceRows, contentWidth, inset: 2 };
   if (cacheOwner) frameCache.set(cacheOwner, { title, source: source.slice(), width, palette, sections: sectionKey, frame });
   return frame;
 }
