@@ -4159,6 +4159,36 @@ if (typeof InteractiveMode.prototype.maybeShowCacheMissNotice === "function") {
     console.log("Composer selection replaced by an editor-extension paste.");
   }
 
+  // Re-pasting the same long block expands its marker instead of adding a second
+  // one. This is pi-double-paste's behaviour, owned here so it does not depend on
+  // which extension supplies the editor component.
+  {
+    const LONG = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
+    const once = composerFixture("");
+    once.editor.handlePaste(LONG);
+    const marker = once.editor.getText();
+    assert.match(marker, /^\[paste #\d+ \+20 lines\]$/u, "a long paste should collapse to a marker");
+    once.editor.handlePaste(LONG);
+    assert.equal(once.editor.getText(), LONG, "re-pasting the same block should expand the marker");
+    once.editor.undo();
+    assert.equal(once.editor.getText(), marker, "expansion should be a single undo step");
+    console.log("Composer repeat-paste expands the existing marker.");
+  }
+
+  // A repeat paste with the caret away from the marker is a normal paste.
+  {
+    const LONG = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
+    const away = composerFixture("");
+    away.editor.handlePaste(LONG);
+    away.editor.setText(`x ${away.editor.getText()}`);
+    away.editor.state.cursorLine = 0;
+    away.editor.setCursorCol(0);
+    away.editor.handlePaste(LONG);
+    const markers = away.editor.getText().match(/\[paste #\d+/gu) ?? [];
+    assert.equal(markers.length, 2, "a paste away from the marker should insert a new one");
+    console.log("Composer repeat-paste away from the marker inserts a new marker.");
+  }
+
   // A selection spanning a logical line break deletes the newline too, and a
   // right-to-left drag keeps both endpoint cells.
   {
