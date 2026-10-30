@@ -14,7 +14,16 @@ import {
   initTheme,
   getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, TuiAltScreen, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  Editor,
+  KeybindingsManager,
+  Markdown,
+  Text,
+  TuiAltScreen,
+  TUI_KEYBINDINGS,
+  stripTerminalSequences,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
 import {
   ActivityTimeline,
   assistantTerminalState,
@@ -60,6 +69,12 @@ const originalPrototypeMethods = [
   ["CustomEditor.render", CustomEditor.prototype, "render"],
   ["CustomEditor.renderTopBorder", CustomEditor.prototype, "renderTopBorder"],
   ["CustomEditor.handleMouse", CustomEditor.prototype, "handleMouse"],
+  ["Editor.handleInput", Editor.prototype, "handleInput"],
+  ["Editor.handleBackspace", Editor.prototype, "handleBackspace"],
+  ["Editor.handleForwardDelete", Editor.prototype, "handleForwardDelete"],
+  ["Editor.insertCharacter", Editor.prototype, "insertCharacter"],
+  ["Editor.handlePaste", Editor.prototype, "handlePaste"],
+  ["TuiAltScreen.getSelectionPoint", TuiAltScreen.prototype, "getSelectionPoint"],
   ["UserMessageComponent.rebuild", UserMessageComponent.prototype, "rebuild"],
 ].map(([label, target, method]) => [label, target, method, target[method]]);
 
@@ -72,10 +87,12 @@ const protoPatchKeys = [
   ["CustomEditor", CustomEditor.prototype, Symbol.for("pretty-tui.rounded-editor-frame")],
   ["UserMessageComponent", UserMessageComponent.prototype, Symbol.for("pretty-tui.user-message-frame")],
   ["Markdown", Markdown.prototype, Symbol.for("pretty-tui.list-bullets")],
+  ["Editor", Editor.prototype, Symbol.for("pretty-tui.composer-selection")],
 ].map(([label, owner, symbol]) => ({ label, owner, symbol }));
 
 const symbolPatchKeys = [
   ["TuiAltScreen", TuiAltScreen.prototype, Symbol.for("pretty-tui.clean-summary-click")],
+  ["TuiAltScreen", TuiAltScreen.prototype, Symbol.for("pretty-tui.composer-selection")],
 ].map(([label, owner, symbol]) => ({ label, owner, symbol }));
 
 const jiti = createJiti(import.meta.url);
@@ -4027,6 +4044,225 @@ if (typeof InteractiveMode.prototype.maybeShowCacheMissNotice === "function") {
   assert.match(notice.render(120).map(stripTerminalSequences).join("\n"), /Cache miss: 79k/);
   assert.equal(notice.render(120).map(stripTerminalSequences)[0], "  ├─ ⚠ Cache miss: 79k tokens re-billed (~$0.15)");
   console.log("Deferred live cache notice joined its tool group.");
+}
+
+// Composer text selection: a drag that starts and ends inside the prompt
+// composer selects the characters it covers, Backspace/Delete delete exactly
+// that range, and typing or pasting replaces it.
+{
+  await emit("session_start", {}, sessionContext([]));
+  const composerFixture = (text, columns = 60, clickCount = 1) => {
+    const tui = { terminal: { rows: 36, columns }, requestRender() {} };
+    const editor = new CustomEditor(tui, { ...theme, borderColor: (value) => value },
+      new KeybindingsManager(TUI_KEYBINDINGS));
+    editor.setText(text);
+    // Render through the patched frame so the fixture layout has the live
+    // shape: a childless leaf whose component holds the editor and whose lines
+    // are the editor's own render, not a fabricated rectangle.
+    const rendered = CustomEditor.prototype.render.call(editor, columns);
+    const rect = { x: 0, y: 31, width: columns, height: rendered.length };
+    const leaf = {
+      component: { children: [editor] }, rect, clip: rect,
+      layer: 0, lines: rendered, children: [],
+    };
+    const root = {
+      component: { children: [] }, rect: { x: 0, y: 0, width: columns, height: 36 },
+      clip: { x: 0, y: 0, width: columns, height: 36 }, layer: 0, children: [leaf],
+    };
+    const screen = Object.assign(Object.create(TuiAltScreen.prototype), {
+      terminal: { rows: 36, columns },
+      // Real screen rows so the native word/line ranges segment the composer.
+      previousScreen: Array(rect.y).fill("").concat(rendered),
+      currentLayout: { root, width: columns, height: 36, lines: [] },
+      copyOnSelect: false,
+      hasOverlay: () => false,
+      requestRender() {},
+      getClickCount: () => clickCount,
+      dispatchMouseToLayout: () => undefined,
+      dispatchMouseToOverlay: () => ({ hit: false }),
+      applyMouseDispatchResult: () => false,
+    });
+    const cell = (column, row = 0) => ({ x: rect.x + 1 + column, y: rect.y + 1 + row });
+    const drag = (from, to = from) => {
+      screen.handleSelectionMouseEvent({ button: 0, release: false, x: from.x, y: from.y });
+      screen.handleSelectionMouseEvent({ button: 32, release: false, x: to.x, y: to.y });
+      screen.handleSelectionMouseEvent({ button: 0, release: true, x: to.x, y: to.y });
+    };
+    return { editor, screen, rect, rendered, cell, drag };
+  };
+
+  // Backspace removes the dragged range, leaves the cursor at its start, drops
+  // the screen highlight, and is a single undo step.
+  {
+    const { editor, screen, cell, drag } = composerFixture("alpha beta");
+    drag(cell(0), cell(4));
+    assert.notEqual(screen.selectionAnchor, undefined, "the drag never anchored a highlight");
+    assert.equal(screen.selectionAnchor.row, screen.selectionFocus.row);
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), " beta", "Backspace did not delete the selection");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
+    assert.equal(screen.selectionAnchor, undefined, "the highlight outlived the deleted text");
+    editor.undo();
+    assert.equal(editor.getText(), "alpha beta", "selection delete was not one undo step");
+    console.log("Composer selection Backspace deleted the dragged range.");
+  }
+
+  // Typing replaces the range in one undo step, and Delete (forward) removes it.
+  {
+    const typing = composerFixture("alpha beta");
+    typing.drag(typing.cell(0), typing.cell(4));
+    typing.editor.handleInput("X");
+    assert.equal(typing.editor.getText(), "X beta", "typing did not replace the selection");
+    assert.deepEqual(typing.editor.getCursor(), { line: 0, col: 1 });
+    typing.editor.undo();
+    assert.equal(typing.editor.getText(), "alpha beta", "replacement typing was not one undo step");
+
+    const forward = composerFixture("alpha beta");
+    forward.drag(forward.cell(6), forward.cell(9));
+    forward.editor.handleInput("\x1b[3~");
+    assert.equal(forward.editor.getText(), "alpha ", "Delete did not delete the selection");
+
+    const pasted = composerFixture("alpha beta");
+    pasted.drag(pasted.cell(0), pasted.cell(4));
+    pasted.editor.handlePaste("Z");
+    assert.equal(pasted.editor.getText(), "Z beta", "paste did not replace the selection");
+    pasted.editor.undo();
+    assert.equal(pasted.editor.getText(), "alpha beta", "replacement paste was not one undo step");
+    console.log("Composer selection replaced by typing, Delete, and paste.");
+  }
+
+  // A selection spanning a logical line break deletes the newline too, and a
+  // right-to-left drag keeps both endpoint cells.
+  {
+    const { editor, cell, drag } = composerFixture("abc\ndef");
+    drag(cell(1, 0), cell(1, 1));
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), "af", "a multi-line selection did not join the lines");
+    assert.deepEqual(editor.getCursor(), { line: 0, col: 1 });
+
+    const backward = composerFixture("alpha beta");
+    backward.drag(backward.cell(4), backward.cell(0));
+    backward.editor.handleInput("\x7f");
+    assert.equal(backward.editor.getText(), " beta", "a right-to-left drag missed a cell");
+  }
+
+  // A range that covers a paste marker drops that marker from the registry, so
+  // a later submit cannot resurrect content the user removed, while a marker
+  // outside the range keeps expanding. Markers are atomic segments, so one cell
+  // inside a marker claims the whole marker.
+  {
+    const both = composerFixture("X");
+    both.editor.handlePaste("row\n".repeat(12));
+    both.editor.handlePaste("cell\n".repeat(12));
+    const first = "[paste #1 +13 lines]";
+    const second = "[paste #2 +13 lines]";
+    assert.equal(both.editor.getText(), `X${first}${second}`);
+    assert.equal(both.editor.pastes.size, 2);
+    both.drag(both.cell(0), both.cell(2));
+    both.editor.handleInput("\x7f");
+    assert.equal(both.editor.getText(), second, "the range did not stop at the second marker");
+    assert.equal(both.editor.pastes.size, 1, "the deleted marker stayed registered or the survivor was dropped");
+    assert.equal(both.editor.getExpandedText(), "cell\n".repeat(12), "the surviving marker stopped expanding");
+  }
+
+  // Ranges end after the whole grapheme: a surrogate pair is never cut in half.
+  {
+    const emoji = composerFixture("\u{1f642}\u{1f642}\u{1f642}");
+    emoji.drag(emoji.cell(0), emoji.cell(2));
+    emoji.editor.handleInput("\x7f");
+    assert.equal(emoji.editor.getText(), "\u{1f642}", "the range cut a grapheme in half");
+  }
+
+  // Wrapped lines map through buildVisualLineMap: dragging to the second visual
+  // row selects logical offsets, not screen offsets.
+  {
+    const text = `${'a'.repeat(70)}${'b'.repeat(20)}`;
+    const { editor, rect, drag } = composerFixture(text);
+    const map = editor.buildVisualLineMap(editor.lastWidth);
+    assert.equal(map.length, 2, "fixture did not wrap into two visual rows");
+    assert.equal(map[1].startCol, editor.lastWidth);
+    drag({ x: rect.x + 1 + 2, y: rect.y + 1 }, { x: rect.x + 1 + 2, y: rect.y + 2 });
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), text.slice(0, 2) + text.slice(map[1].startCol + 3));
+  }
+
+  // The selection is bounded by the composer: dragging above it clamps to the
+  // first text row and column instead of swallowing transcript rows.
+  {
+    const { editor, screen, rect, cell } = composerFixture("alpha beta");
+    screen.handleSelectionMouseEvent({ button: 0, release: false, x: cell(5).x, y: cell(5).y });
+    screen.handleSelectionMouseEvent({ button: 32, release: false, x: 0, y: rect.y - 10 });
+    screen.handleSelectionMouseEvent({ button: 0, release: true, x: 0, y: rect.y - 10 });
+    assert.equal(screen.selectionFocus.row, rect.y + 1, "highlight escaped the composer rows");
+    assert.equal(screen.selectionFocus.col, rect.x + 1, "highlight escaped the composer columns");
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), "beta", "the clamped range was not applied");
+  }
+
+  // A drag that starts outside the composer is not a composer selection, and a
+  // plain click still reaches the editor; arrow keys drop the range.
+  {
+    const outside = composerFixture("alpha beta");
+    outside.screen.handleSelectionMouseEvent({ button: 0, release: false, x: 2, y: 5 });
+    outside.screen.handleSelectionMouseEvent({ button: 32, release: false, x: 10, y: outside.rect.y - 1 });
+    outside.screen.handleSelectionMouseEvent({ button: 0, release: true, x: 10, y: outside.rect.y - 1 });
+    outside.editor.handleInput("\x7f");
+    assert.equal(outside.editor.getText(), "alpha bet", "a transcript drag deleted a composer range");
+
+    // A modal over the composer owns its clicks, so no range starts behind it.
+    const modal = composerFixture("alpha beta");
+    modal.screen.hasOverlay = () => true;
+    modal.drag(modal.cell(0), modal.cell(4));
+    modal.editor.handleInput("\x7f");
+    assert.equal(modal.editor.getText(), "alpha bet", "a drag selected through a modal overlay");
+
+    const clicked = composerFixture("alpha beta");
+    const dispatches = [];
+    clicked.screen.dispatchMouseToLayout = (event) => { dispatches.push(event); return undefined; };
+    clicked.screen.handleSelectionMouseEvent({ button: 0, release: false, x: clicked.cell(3).x, y: clicked.cell(3).y });
+    clicked.screen.handleSelectionMouseEvent({ button: 0, release: true, x: clicked.cell(3).x, y: clicked.cell(3).y });
+    assert.equal(dispatches.length, 1, "click-to-cursor stopped reaching the editor");
+
+    // A click is not a one-character range: Backspace keeps deleting the
+    // character before the cursor instead of the clicked cell.
+    const clickOnly = composerFixture("alpha beta");
+    clickOnly.screen.dispatchMouseToLayout = () => { clickOnly.editor.setCursorCol(5); return undefined; };
+    clickOnly.screen.handleSelectionMouseEvent({ button: 0, release: false, x: clickOnly.cell(5).x, y: clickOnly.cell(5).y });
+    clickOnly.screen.handleSelectionMouseEvent({ button: 0, release: true, x: clickOnly.cell(5).x, y: clickOnly.cell(5).y });
+    clickOnly.editor.handleInput("\x7f");
+    assert.equal(clickOnly.editor.getText(), "alph beta", "a click left a one-character range behind");
+
+    const cancelled = composerFixture("alpha beta");
+    cancelled.drag(cancelled.cell(0), cancelled.cell(4));
+    cancelled.editor.handleInput("\x1b[D");
+    assert.equal(cancelled.screen.selectionAnchor, undefined, "arrow keys left the highlight behind");
+    cancelled.editor.handleInput("\x7f");
+    assert.equal(cancelled.editor.getText(), "alpha bea", "arrow keys did not cancel the range");
+  }
+
+  // Multi-click ranges are the renderer's: the deleted range has to match the
+  // word or line highlight, not just the pressed cell.
+  {
+    const word = composerFixture("alpha beta", 60, 2);
+    word.drag(word.cell(2));
+    word.editor.handleInput("\x7f");
+    assert.equal(word.editor.getText(), " beta", "double-click did not delete the whole word");
+
+    const line = composerFixture("alpha beta", 60, 3);
+    line.drag(line.cell(2));
+    line.editor.handleInput("\x7f");
+    assert.equal(line.editor.getText(), "", "triple-click did not delete the whole line");
+  }
+
+  // Replacing the text behind the selection invalidates the stored offsets.
+  {
+    const { editor, cell, drag } = composerFixture("alpha beta");
+    drag(cell(0), cell(4));
+    editor.setText("other");
+    editor.handleInput("\x7f");
+    assert.equal(editor.getText(), "othe", "a stale selection survived a programmatic setText");
+  }
+  console.log("Composer text selection passed.");
 }
 
 InteractiveMode.prototype.showStatus.call(

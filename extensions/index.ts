@@ -39,7 +39,9 @@ import {
   type TuiMouseEvent,
   visibleWidth,
   wrapTextWithAnsi,
+  getKeybindings,
   getOsc8LinkAtColumn,
+  matchesKey,
 } from "@earendil-works/pi-tui";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -2251,6 +2253,388 @@ export default function prettyTui(pi: ExtensionAPI) {
       ) {
         delete altScreenPrototype[cleanSummaryClickPatchKey];
       }
+    });
+  }
+
+  // Composer text selection: a drag that starts and ends inside the prompt
+  // composer selects the characters it covers. Backspace/Delete remove the
+  // range, and typing or pasting replaces it, the way `micro` behaves. The
+  // renderer's screen-level highlight stays the visual affordance: selection
+  // points are clamped into the composer's text area before the native handler
+  // stores them (via getSelectionPoint), so the highlight can never spill into
+  // the transcript or onto the frame. Drag events only exist on the alt screen,
+  // so regular TUI mode keeps its native behaviour untouched.
+  const composerSelectionPatchKey = Symbol.for("pretty-tui.composer-selection");
+  const composerDragKey = Symbol("pretty-tui.composer-drag");
+  const promptEditorPrototype = Object.getPrototypeOf(customEditorPrototype);
+  if (!altScreenPrototype[composerSelectionPatchKey]) {
+    const PromptEditorClass = promptEditorPrototype.constructor;
+    type ComposerSpan = { start: number; end: number };
+    type ComposerSelection = { screen: any; editor: any; text: string; start: number; end: number };
+    let composerSelection: ComposerSelection | undefined;
+
+    // Pi lays the prompt editor out inside a childless leaf that carries its
+    // rendered lines, so the editor is found through the component tree of the
+    // leaf, not by matching the box's own component.
+    const isComposerEditor = (component: any): boolean =>
+      component instanceof PromptEditorClass && typeof component.buildVisualLineMap === "function";
+    const findComposerEditor = (component: any, depth = 0): any => {
+      if (!component || depth > 8) return undefined;
+      if (isComposerEditor(component)) return component;
+      const children = component.children;
+      if (!Array.isArray(children)) return undefined;
+      for (const child of children) {
+        const editor = findComposerEditor(child, depth + 1);
+        if (editor) return editor;
+      }
+      return undefined;
+    };
+    const composerFrame = (screen: any): { box: any; editor: any } | undefined => {
+      const root = screen?.currentLayout?.root;
+      if (!root) return undefined;
+      let found: { box: any; editor: any } | undefined;
+      const visit = (box: any, depth: number) => {
+        if (!box || depth > 12) return;
+        if (box.rect && box.rect.width >= 3 && (box.lines?.length ?? 0) > 0) {
+          const editor = findComposerEditor(box.component);
+          if (editor) found = { box, editor };
+        }
+        for (const child of box.children ?? []) visit(child, depth + 1);
+      };
+      visit(root, 0);
+      return found;
+    };
+    // Our rounded frame replaces the editor's first line, which pins where the
+    // editor's own render starts inside the leaf (0 without the frame patch).
+    const composerTopIndex = (box: any): number => {
+      const lines: string[] = box.lines ?? [];
+      for (let index = 0; index < lines.length; index += 1) {
+        if (stripTerminalSequences(lines[index]).startsWith("╭")) return index;
+      }
+      return 0;
+    };
+    const composerGeometry = (frame: { box: any; editor: any }) => {
+      const { box, editor } = frame;
+      const topIndex = composerTopIndex(box);
+      const visible = Math.max(1, Number(editor.renderedVisibleLineCount) || 1);
+      return {
+        box,
+        editor,
+        contentLeft: box.rect.x + 1,
+        contentRight: box.rect.x + box.rect.width - 2,
+        textTop: box.rect.y + topIndex + 1,
+        textBottom: box.rect.y + topIndex + visible,
+      };
+    };
+    // Same visual-row/column mapping the editor's own click handler uses, with
+    // both the leading border column and paddingX removed, plus the right edge
+    // of the character cell so a range can end after its last grapheme.
+    const composerSpanAt = (geometry: any, screenCol: number, screenRow: number, boundary = false): ComposerSpan | undefined => {
+      const { box, editor } = geometry;
+      const row = Math.max(geometry.textTop, Math.min(geometry.textBottom, screenRow));
+      const visualLines = editor.buildVisualLineMap(editor.lastWidth);
+      const visualIndex = (Number(editor.scrollOffset) || 0) + (row - geometry.textTop);
+      const visualLine = visualLines[visualIndex];
+      if (!visualLine) return undefined;
+      const lines: string[] = editor.state?.lines ?? [];
+      const logical = lines[visualLine.logicalLine] ?? "";
+      const chunk = logical.slice(visualLine.startCol, visualLine.startCol + visualLine.length);
+      const innerWidth = Math.max(1, box.rect.width - 2);
+      const maxPadding = Math.max(0, Math.floor((innerWidth - 1) / 2));
+      const paddingX = Math.min(Number(editor.paddingX) || 0, maxPadding);
+      const rawColumn = screenCol - box.rect.x - 1 - paddingX;
+      const targetColumn = boundary ? Math.max(0, rawColumn) : Math.max(0, Math.min(innerWidth - 1, rawColumn));
+      const segments = editor.segment?.(chunk, "grapheme") ?? [];
+      let column = 0;
+      let start = chunk.length;
+      let end = chunk.length;
+      let lastStart = 0;
+      let lastEnd = 0;
+      if (boundary) {
+        // An exclusive endpoint (word/line range) is an insertion position, not
+        // a cell: a column past the text is the end of the line, never the last
+        // character, and a column inside a wide grapheme rounds past it.
+        for (const grapheme of segments) {
+          const next = column + visibleWidth(grapheme.segment);
+          if (targetColumn <= column) {
+            start = grapheme.index;
+            break;
+          }
+          if (targetColumn < next) {
+            start = grapheme.index + grapheme.segment.length;
+            break;
+          }
+          column = next;
+        }
+        end = start;
+      } else {
+        for (const grapheme of segments) {
+          const next = column + visibleWidth(grapheme.segment);
+          lastStart = grapheme.index;
+          lastEnd = grapheme.index + grapheme.segment.length;
+          if (targetColumn < next) {
+            start = grapheme.index;
+            end = lastEnd;
+            break;
+          }
+          column = next;
+        }
+        const isLastSegment = visualIndex === visualLines.length - 1 ||
+          visualLines[visualIndex + 1]?.logicalLine !== visualLine.logicalLine;
+        if (!isLastSegment && start === chunk.length && chunk.length > 0) {
+          start = lastStart;
+          end = lastEnd;
+        }
+      }
+      let lineStart = 0;
+      for (let index = 0; index < visualLine.logicalLine; index += 1) {
+        lineStart += (lines[index] ?? "").length + 1;
+      }
+      return { start: lineStart + visualLine.startCol + start, end: lineStart + visualLine.startCol + end };
+    };
+    const clampComposerPoint = (geometry: any, event: any) => ({
+      row: Math.max(geometry.textTop, Math.min(geometry.textBottom, event.y)),
+      col: Math.max(geometry.contentLeft, Math.min(geometry.contentRight, event.x)),
+    });
+    const storeComposerSelection = (screen: any, editor: any, anchor?: ComposerSpan, focus?: ComposerSpan) => {
+      if (!anchor || !focus) return;
+      // Both endpoints resolve to the same cell for a click (or a drag that
+      // returns to where it started): that is not a range, and Backspace must
+      // keep deleting the character before the cursor.
+      if (anchor.start === focus.start && anchor.end === focus.end) return;
+      // Both endpoints are character cells: the anchor and the focus keep the
+      // cell they point at, so a drag in either direction includes it.
+      const forward = focus.start >= anchor.start;
+      const start = forward ? anchor.start : focus.start;
+      const end = forward ? focus.end : anchor.end;
+      const text = editor.getText();
+      if (end <= start || start < 0 || end > text.length) return;
+      composerSelection = { screen, editor, text, start, end };
+    };
+    const clearComposerSelection = (editor?: any, clearNative = false) => {
+      const active = composerSelection;
+      if (!active) return;
+      if (editor && active.editor !== editor) return;
+      composerSelection = undefined;
+      if (!clearNative) return;
+      // The screen highlight indicates the deleted range, so it has to go with
+      // it; a stale anchor would otherwise keep painting over new text.
+      try {
+        active.screen?.clearTextSelection?.();
+        active.screen?.requestRender?.();
+      } catch {
+        // Selection highlighting is best-effort.
+      }
+    };
+    const activeComposerSelection = (editor: any): ComposerSelection | undefined => {
+      const active = composerSelection;
+      if (!active || active.editor !== editor) return undefined;
+      // Anything that edits or replaces the text outside this patch (submit,
+      // history recall, external setText) invalidates the stored offsets.
+      if (editor.getText() !== active.text || active.end <= active.start) {
+        composerSelection = undefined;
+        return undefined;
+      }
+      return active;
+    };
+    const removeComposerRange = (editor: any, selection: ComposerSelection, pushUndo: boolean): boolean => {
+      // Callers reach this only through activeComposerSelection, which rejects a
+      // range whose text snapshot no longer matches the editor.
+      const text = selection.text;
+      const start = Math.max(0, Math.min(text.length, selection.start));
+      const end = Math.max(start, Math.min(text.length, selection.end));
+      if (end <= start) return false;
+      const removed = text.slice(start, end);
+      const next = text.slice(0, start) + text.slice(end);
+      const before = text.slice(0, start);
+      const cursorLine = before.split("\n").length - 1;
+      const cursorCol = before.length - before.lastIndexOf("\n") - 1;
+      if (pushUndo) editor.pushUndoSnapshot?.();
+      editor.cancelAutocomplete?.();
+      editor.exitHistoryBrowsing?.();
+      editor.lastAction = null;
+      editor.state.lines = next.length > 0 ? next.split("\n") : [""];
+      editor.state.cursorLine = Math.max(0, Math.min(editor.state.lines.length - 1, cursorLine));
+      const target = editor.state.lines[editor.state.cursorLine] ?? "";
+      editor.setCursorCol(Math.max(0, Math.min(target.length, cursorCol)));
+      // Drop only the paste markers the range removed completely, so a later
+      // submit cannot resurrect their content; surviving markers keep their ids.
+      if (editor.pastes instanceof Map) {
+        for (const match of removed.matchAll(/\[paste #(\d+)(?: \+\d+ lines| \d+ chars)?\]/g)) {
+          editor.pastes.delete(Number(match[1]));
+        }
+      }
+      if (editor.autocompleteState) editor.updateAutocomplete?.();
+      editor.onChange?.(editor.getText());
+      return true;
+    };
+    const deleteComposerSelection = (editor: any): boolean => {
+      const active = activeComposerSelection(editor);
+      if (!active) return false;
+      const removed = removeComposerRange(editor, active, true);
+      clearComposerSelection(undefined, true);
+      return removed;
+    };
+    const isComposerEditInput = (editor: any, data: string): boolean => {
+      if (!data) return false;
+      if (editor?.isInPaste) return true; // paste content still arriving
+      if (data.includes("\x1b[200~")) return true; // bracketed paste replaces the range
+      if (!/[\x00-\x1f\x7f]/.test(data)) return true; // printable text replaces it
+      try {
+        const keybindings = getKeybindings();
+        if (keybindings.matches(data, "tui.editor.deleteCharBackward") ||
+          keybindings.matches(data, "tui.editor.deleteCharForward")) {
+          return true;
+        }
+      } catch {
+        // Fall back to the raw key sequences below.
+      }
+      try {
+        return matchesKey(data, "shift+backspace") || matchesKey(data, "shift+delete");
+      } catch {
+        return false;
+      }
+    };
+
+    const originalComposerSelectionPoint = altScreenPrototype.getSelectionPoint;
+    const originalComposerHandleInput = promptEditorPrototype.handleInput;
+    const originalComposerBackspace = promptEditorPrototype.handleBackspace;
+    const originalComposerForwardDelete = promptEditorPrototype.handleForwardDelete;
+    const originalComposerInsertCharacter = promptEditorPrototype.insertCharacter;
+    const originalComposerHandlePaste = promptEditorPrototype.handlePaste;
+
+    // Press/motion/release all pass through getSelectionPoint, which keeps the
+    // patch independent of the selection handler's own branches: the anchor is
+    // the renderer's anchor (so multi-click word ranges keep working) and the
+    // focus is clamped into the composer before the highlight is stored.
+    const patchedComposerSelectionPoint = function (this: any, event: any, scrollView: any) {
+      const point = originalComposerSelectionPoint.call(this, event, scrollView);
+      try {
+        // A modal over the composer owns its own clicks; never select through it.
+        if (this.hasOverlay?.()) {
+          delete this[composerDragKey];
+          return point;
+        }
+        const isMotion = (event.button & 32) !== 0;
+        const drag = this[composerDragKey];
+        if (!event.release && !isMotion) {
+          clearComposerSelection(undefined, true);
+          delete this[composerDragKey];
+          if (scrollView) return point;
+          const frame = composerFrame(this);
+          if (!frame) return point;
+          const geometry = composerGeometry(frame);
+          if (event.x < geometry.contentLeft || event.x > geometry.contentRight ||
+            event.y < geometry.textTop || event.y > geometry.textBottom) {
+            return point;
+          }
+          this[composerDragKey] = { geometry };
+          return point;
+        }
+        if (!drag) return point;
+        const clamped = clampComposerPoint(drag.geometry, event);
+        if (isMotion) return clamped;
+        delete this[composerDragKey];
+        // A multi-click word or line range is the renderer's; delete exactly
+        // what its highlight shows instead of the raw press/release cells.
+        const granular = this.selectionGranularity !== "character" && this.selectionInitialRange;
+        const anchorPoint = granular
+          ? this.selectionInitialRange.start
+          : this.selectionAnchor ?? { row: clamped.row, col: clamped.col };
+        const focusPoint = granular ? this.selectionFocus ?? clamped : clamped;
+        storeComposerSelection(
+          this,
+          drag.geometry.editor,
+          composerSpanAt(drag.geometry, anchorPoint.col ?? clamped.col, anchorPoint.row ?? clamped.row,
+            anchorPoint.boundary === true),
+          composerSpanAt(drag.geometry, focusPoint.col ?? clamped.col, focusPoint.row ?? clamped.row,
+            focusPoint.boundary === true),
+        );
+        return clamped;
+      } catch {
+        return point;
+      }
+    };
+    const patchedComposerHandleInput = function (this: any, data: string) {
+      if (activeComposerSelection(this) && !isComposerEditInput(this, data)) clearComposerSelection(this, true);
+      return originalComposerHandleInput.call(this, data);
+    };
+    const patchedComposerBackspace = function (this: any) {
+      if (deleteComposerSelection(this)) return;
+      return originalComposerBackspace.call(this);
+    };
+    const patchedComposerForwardDelete = function (this: any) {
+      if (deleteComposerSelection(this)) return;
+      return originalComposerForwardDelete.call(this);
+    };
+    // The delete already pushed one undo snapshot, so the replacement inserts
+    // without a second one and a single undo restores the pre-selection text.
+    const patchedComposerInsertCharacter = function (this: any, char: string, skipUndoCoalescing?: boolean) {
+      const active = activeComposerSelection(this);
+      if (!active) return originalComposerInsertCharacter.call(this, char, skipUndoCoalescing);
+      if (!removeComposerRange(this, active, true)) {
+        clearComposerSelection(this);
+        return originalComposerInsertCharacter.call(this, char, skipUndoCoalescing);
+      }
+      clearComposerSelection(undefined, true);
+      originalComposerInsertCharacter.call(this, char, true);
+      this.lastAction = null;
+    };
+    const patchedComposerHandlePaste = function (this: any, pastedText: string) {
+      const active = activeComposerSelection(this);
+      if (!active) return originalComposerHandlePaste.call(this, pastedText);
+      // One undo step for "replace selection with paste": snapshot before the
+      // delete, then keep handlePaste from snapshotting the already-shrunk text.
+      this.pushUndoSnapshot?.();
+      const removed = removeComposerRange(this, active, false);
+      clearComposerSelection(undefined, true);
+      if (!removed) return originalComposerHandlePaste.call(this, pastedText);
+      const hadOwnPush = Object.prototype.hasOwnProperty.call(this, "pushUndoSnapshot");
+      const ownPush = this.pushUndoSnapshot;
+      this.pushUndoSnapshot = () => {};
+      try {
+        originalComposerHandlePaste.call(this, pastedText);
+      } finally {
+        if (hadOwnPush) this.pushUndoSnapshot = ownPush;
+        else delete this.pushUndoSnapshot;
+      }
+    };
+
+    const composerPatch = {
+      originalSelectionPoint: originalComposerSelectionPoint,
+      patchedSelectionPoint: patchedComposerSelectionPoint,
+      editorMethods: [
+        ["handleInput", originalComposerHandleInput, patchedComposerHandleInput],
+        ["handleBackspace", originalComposerBackspace, patchedComposerBackspace],
+        ["handleForwardDelete", originalComposerForwardDelete, patchedComposerForwardDelete],
+        ["insertCharacter", originalComposerInsertCharacter, patchedComposerInsertCharacter],
+        ["handlePaste", originalComposerHandlePaste, patchedComposerHandlePaste],
+      ] as Array<[string, any, any]>,
+    };
+    altScreenPrototype[composerSelectionPatchKey] = composerPatch;
+    promptEditorPrototype[composerSelectionPatchKey] = composerPatch;
+    // Install only what this Pi version exposes: an upstream rename has to leave
+    // the composer on its native path instead of breaking every mouse gesture.
+    if (typeof originalComposerSelectionPoint === "function") {
+      altScreenPrototype.getSelectionPoint = patchedComposerSelectionPoint;
+    }
+    for (const [name, original, patched] of composerPatch.editorMethods) {
+      if (typeof original === "function" && typeof patched === "function") {
+        promptEditorPrototype[name] = patched;
+      }
+    }
+
+    pi.on("session_shutdown", () => {
+      const patch = altScreenPrototype[composerSelectionPatchKey];
+      if (patch?.patchedSelectionPoint === altScreenPrototype.getSelectionPoint) {
+        altScreenPrototype.getSelectionPoint = patch.originalSelectionPoint;
+      }
+      for (const [name, original, patched] of patch?.editorMethods ?? []) {
+        if (promptEditorPrototype[name] === patched) promptEditorPrototype[name] = original;
+      }
+      composerSelection = undefined;
+      delete altScreenPrototype[composerSelectionPatchKey];
+      delete promptEditorPrototype[composerSelectionPatchKey];
     });
   }
 
