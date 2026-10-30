@@ -2618,9 +2618,66 @@ export default function prettyTui(pi: ExtensionAPI) {
       originalComposerInsertCharacter.call(this, char, true);
       this.lastAction = null;
     };
+    // Pi natively collapses a long paste into an atomic [paste #N ...] marker and
+    // stores the text in `pastes`. Re-pasting the same block next to its marker is
+    // more useful as an expand than as a second identical marker, so do that here.
+    // Owning it (rather than relying on an extension that replaces the whole
+    // editor component) keeps it working no matter which class supplies the
+    // composer, and it composes with the selection-replace path below.
+    const LONG_PASTE_LINES = 10;
+    const LONG_PASTE_CHARS = 1000;
+    const cleanPastedText = (editor: any, pastedText: string): string => {
+      const normalized = typeof editor.normalizeText === "function"
+        ? editor.normalizeText(pastedText)
+        : pastedText.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n").replace(/\t/gu, "    ");
+      return normalized
+        .split("")
+        .filter((char: string) => char === "\n" || char.charCodeAt(0) >= 32)
+        .join("");
+    };
+    const caretOffset = (editor: any, text: string): number => {
+      const caret = editor.getCursor?.() ?? { line: 0, col: 0 };
+      const lines = text.split("\n");
+      let offset = 0;
+      for (let i = 0; i < Math.min(caret.line, lines.length); i++) offset += lines[i].length + 1;
+      return offset + caret.col;
+    };
+    const expandRepeatPaste = (editor: any, pastedText: string): boolean => {
+      if (!(editor.pastes instanceof Map) || editor.pastes.size === 0) return false;
+      const cleaned = cleanPastedText(editor, pastedText);
+      if (cleaned.split("\n").length <= LONG_PASTE_LINES && cleaned.length <= LONG_PASTE_CHARS) return false;
+      const text = editor.getText();
+      const caret = caretOffset(editor, text);
+      for (const [id, stored] of editor.pastes) {
+        if (typeof stored !== "string") continue;
+        // Pi prepends a readability space to path-like pastes; treat the two
+        // cleaned forms as the same block.
+        if (stored !== cleaned && !(stored.startsWith(" ") && stored.slice(1) === cleaned)) continue;
+        const marker = new RegExp(`\\[paste #${id}(?: \\+\\d+ lines| \\d+ chars)?\\]`, "u");
+        const found = marker.exec(text);
+        if (!found) continue;
+        const start = found.index;
+        const end = start + found[0].length;
+        if (caret < start || caret > end) continue;
+        editor.setText(text.slice(0, start) + stored + text.slice(end));
+        const before = text.slice(0, start) + stored;
+        const line = before.split("\n").length - 1;
+        const col = before.length - before.lastIndexOf("\n") - 1;
+        editor.state.cursorLine = Math.max(0, Math.min(editor.state.lines.length - 1, line));
+        const target = editor.state.lines[editor.state.cursorLine] ?? "";
+        editor.setCursorCol(Math.max(0, Math.min(target.length, col)));
+        editor.onChange?.(editor.getText());
+        return true;
+      }
+      return false;
+    };
+
     const patchedComposerHandlePaste = function (this: any, pastedText: string) {
       const active = activeComposerSelection(this);
-      if (!active) return originalComposerHandlePaste.call(this, pastedText);
+      if (!active) {
+        if (expandRepeatPaste(this, pastedText)) return;
+        return originalComposerHandlePaste.call(this, pastedText);
+      }
       // One undo step for "replace selection with paste": snapshot before the
       // delete, then keep handlePaste from snapshotting the already-shrunk text.
       this.pushUndoSnapshot?.();
