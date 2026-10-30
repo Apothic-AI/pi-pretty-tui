@@ -1,5 +1,6 @@
 import { isNativeImageRow } from "./ansi-style.js";
 import { cardMargin, cardBackground, frameNativeRows, nativeFrameWidth } from "./full-frame.js";
+import { selectionText } from "./selection-chrome.js";
 import { ThoughtPresentation } from "./thought-presentation.js";
 import { isThirdPartyTool, renderToolProjection, toolLabel, type ToolProjection } from "./tool-presentation.js";
 import { NestedTools, NESTED_SNAPSHOT_ENTRY } from "./nested-tools.js";
@@ -29,6 +30,7 @@ import {
   getAgentDir,
   getMarkdownTheme,
   type ExtensionAPI,
+  type ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
@@ -78,6 +80,26 @@ const loadConfig = (path: string): PrettyTuiConfig => {
     return {};
   }
 };
+
+// --- LOCAL FORK PATCH (see LOCAL-PATCHES.md) -------------------------------------------
+//
+// This extension must never own a tool name. Pi allows only one owner per tool name and
+// fails the whole loser extension when two register the same one, and bizzy (background
+// tasks) owns `bash`. Every built-in rendered here is render-only, so the registrations go
+// through `pi.registerToolRenderer`, which composes: resolvers run in extension load order
+// and `next()` chains to the remaining resolvers and then to whichever extension owns the
+// tool.
+//
+// The resolver's return value replaces the tool definition Pi renders with, so returning
+// `renderers` alone would drop the owner's name, description, parameters, label, and any
+// extra fields it carries. Spread the owner over our renderers to change only drawing.
+function registerRenderedTool(pi: ExtensionAPI, tool: { name?: string }, renderers: ToolRenderers): void {
+  const toolName = tool.name;
+  if (!toolName) throw new Error("registerRenderedTool needs a named tool definition");
+  pi.registerToolRenderer((name, next) =>
+    name === toolName ? { ...next(), ...renderers } : next(),
+  );
+}
 
 /** Polished user messages, tool calls, and list rendering for Pi's TUI. */
 export default function prettyTui(pi: ExtensionAPI) {
@@ -812,7 +834,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const fitInnerWidth = (line: string) =>
         line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
 
-      return lines.map((line, index) => {
+      const rendered = lines.map((line, index) => {
         const fitted = fitInnerWidth(line);
         if (index === 0) return this.borderColor("╭") + fitted + this.borderColor("╮");
         if (index === bottomBorderIndex) return this.borderColor("╰") + fitted + this.borderColor("╯");
@@ -820,6 +842,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         // Autocomplete remains outside the input frame, aligned to its content.
         return " " + fitted + " ";
       });
+      return rendered;
     };
     const patchedEditorHandleMouse = function (this: any, event: any) {
       if (event.width < 3) return originalEditorHandleMouse.call(this, event);
@@ -880,6 +903,9 @@ export default function prettyTui(pi: ExtensionAPI) {
       originalUserMessageRebuild.call(this);
       const content = this.children?.[0] as any;
       if (!content) return;
+      // Pi lays out the message component, not the frame wrapper it creates, so
+      // chrome the frame records has to be reachable from the message too.
+      const messageOwner = this;
 
       // Remove Pi's full-width user-message background. The Markdown keeps its
       // native foreground styling, while the surrounding bubble stays transparent.
@@ -974,8 +1000,9 @@ export default function prettyTui(pi: ExtensionAPI) {
               ? cardBackground(line, width, defaultActivityTheme(), "toolPendingBg", "mdHeading") : left + line + right);
           }
           if (renderMode !== "clean") {
-            return frameNativeRows("User", measured.body, width, defaultActivityTheme(), undefined,
-              frame, "mdHeading", "", "mdHeading").lines;
+            const native = frameNativeRows("User", measured.body, width, defaultActivityTheme(), undefined,
+              frame, "mdHeading", "", "mdHeading");
+            return native.lines;
           }
 
           const top = border("╭" + "─".repeat(Math.max(0, measured.frameWidth - 2)) + "╮");
@@ -984,6 +1011,16 @@ export default function prettyTui(pi: ExtensionAPI) {
             const padding = " ".repeat(Math.max(0, measured.contentWidth - visibleWidth(line)));
             return border("│ ") + line + padding + border(" │");
           });
+          // The rule rows and both gutters are chrome; the selection clamps to
+          // the content between them, offset by the bubble's outer padding.
+          // Rebuild the closure per render, never memoize it: it closes over the
+          // geometry of the width it was created for, and a re-render at another
+          // width (or after the text changed) would clamp against stale columns.
+          const cleanChrome = (rowIndex: number) => {
+            if (rowIndex === 0 || rowIndex === measured.body.length + 1) return "frame";
+            if (rowIndex > measured.body.length + 1) return undefined;
+            return { left: measured.leftPad + 2, right: measured.rightPad + 2 };
+          };
           return [top, ...body, bottom].map((line: string) => left + line + right);
         },
         handleMouse(event: any) {
@@ -2636,6 +2673,35 @@ export default function prettyTui(pi: ExtensionAPI) {
       delete altScreenPrototype[composerSelectionPatchKey];
       delete promptEditorPrototype[composerSelectionPatchKey];
     });
+  }
+
+  // Copying a selection must not carry our frames into the clipboard. Pi builds
+  // copied text from the rendered buffer, so clamp it to the chrome recorded by
+  // the renderers above. Patching the instance method (not the prototype) keeps
+  // the host's own copy path intact for every screen without our chrome.
+  const selectionCopyPatchKey = Symbol.for("pretty-tui.selection-copy");
+  {
+    const originalGetActiveSelectionText = altScreenPrototype.getActiveSelectionText;
+    // Pi's text is authoritative about what was selected; the only thing wrong
+    // with it is the frame art it carries, so post-process that away.
+    const patchedGetActiveSelectionText = function (this: any) {
+      const text = originalGetActiveSelectionText.call(this);
+      return typeof text === "string" ? selectionText(text) : text;
+    };
+    altScreenPrototype[selectionCopyPatchKey] = {
+      originalGetActiveSelectionText,
+      patchedGetActiveSelectionText,
+    };
+    altScreenPrototype.getActiveSelectionText = patchedGetActiveSelectionText;
+
+    pi.on("session_shutdown", () => {
+      const patch = altScreenPrototype[selectionCopyPatchKey];
+      if (patch?.patchedGetActiveSelectionText === altScreenPrototype.getActiveSelectionText) {
+        altScreenPrototype.getActiveSelectionText = patch.originalGetActiveSelectionText;
+      }
+      if (patch && altScreenPrototype.getActiveSelectionText === patch.originalGetActiveSelectionText) {
+        delete altScreenPrototype[selectionCopyPatchKey];
+      }    });
   }
 
   // Refine Pi's Markdown presentation while preserving its parser and themes.
@@ -4729,7 +4795,8 @@ export default function prettyTui(pi: ExtensionAPI) {
       state[kind] = component;
       return component;
     };
-    pi.registerTool({ ...definition,
+    registerRenderedTool(pi, definition, {
+      ...(definition.renderShell ? { renderShell: definition.renderShell } : {}),
       renderCall: (...args: any[]) => select("renderCall", args),
       renderResult: (...args: any[]) => select("renderResult", args),
     });

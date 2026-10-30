@@ -52,7 +52,10 @@ function renderPanel(
   const sourceRows = new Map<number, number>();
   if (width < 8) {
     source.forEach((_, y) => sourceRows.set(y, y));
-    return { lines: source.map((row) => cardBackground(row, width, theme, background, borderColor)), sourceRows, contentWidth: Math.max(1, width), inset: 0 };
+    return {
+      lines: source.map((row) => cardBackground(row, width, theme, background, borderColor)),
+      sourceRows, contentWidth: Math.max(1, width), inset: 0,
+    };
   }
   const contentWidth = width - 4;
   const border = (s: string) => theme.fg(borderColor, s);
@@ -97,6 +100,8 @@ export function frameNativeRows(
   if (!margin) return frame;
   const cached = gutterFrames.get(frame);
   if (cached) return cached;
+  // Outer gutters are chrome on both sides, so the frame keeps the same line
+  // indices and the copy clamp widens by the margin on each side.
   const padded = { ...frame, inset: frame.inset + margin,
     lines: frame.lines.map((line) => isNativeImageRow(line) ? line : " ".repeat(margin) + line + " ".repeat(margin)),
   };
