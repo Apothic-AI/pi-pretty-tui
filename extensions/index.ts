@@ -2502,6 +2502,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     const originalComposerForwardDelete = promptEditorPrototype.handleForwardDelete;
     const originalComposerInsertCharacter = promptEditorPrototype.insertCharacter;
     const originalComposerHandlePaste = promptEditorPrototype.handlePaste;
+    const originalComposerInsertTextAtCursorInternal = promptEditorPrototype.insertTextAtCursorInternal;
 
     // Press/motion/release all pass through getSelectionPoint, which keeps the
     // patch independent of the selection handler's own branches: the anchor is
@@ -2600,6 +2601,32 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
     };
 
+    // Any insertion replaces the selection, not just the ones that arrive via
+    // handlePaste. An extension that owns the editor (pi-double-paste installs a
+    // CustomEditor subclass and intercepts bracketed paste in its own
+    // handleInput) inserts its paste marker through insertTextAtCursorInternal
+    // directly, so a delete-on-paste hook placed in handlePaste never runs for
+    // it: the selection survived and a later Backspace would eat it.
+    const patchedComposerInsertTextAtCursorInternal = function (this: any, text: string, ...rest: any[]) {
+      const active = activeComposerSelection(this);
+      if (!active) return originalComposerInsertTextAtCursorInternal.call(this, text, ...rest);
+      // One undo step for "replace selection with insertion": snapshot before the
+      // delete, then keep the insert from snapshotting the already-shrunk text.
+      this.pushUndoSnapshot?.();
+      const removed = removeComposerRange(this, active, false);
+      clearComposerSelection(undefined, true);
+      if (!removed) return originalComposerInsertTextAtCursorInternal.call(this, text, ...rest);
+      const hadOwnPush = Object.prototype.hasOwnProperty.call(this, "pushUndoSnapshot");
+      const ownPush = this.pushUndoSnapshot;
+      this.pushUndoSnapshot = () => {};
+      try {
+        return originalComposerInsertTextAtCursorInternal.call(this, text, ...rest);
+      } finally {
+        if (hadOwnPush) this.pushUndoSnapshot = ownPush;
+        else delete this.pushUndoSnapshot;
+      }
+    };
+
     const composerPatch = {
       originalSelectionPoint: originalComposerSelectionPoint,
       patchedSelectionPoint: patchedComposerSelectionPoint,
@@ -2609,6 +2636,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         ["handleForwardDelete", originalComposerForwardDelete, patchedComposerForwardDelete],
         ["insertCharacter", originalComposerInsertCharacter, patchedComposerInsertCharacter],
         ["handlePaste", originalComposerHandlePaste, patchedComposerHandlePaste],
+        ["insertTextAtCursorInternal", originalComposerInsertTextAtCursorInternal, patchedComposerInsertTextAtCursorInternal],
       ] as Array<[string, any, any]>,
     };
     altScreenPrototype[composerSelectionPatchKey] = composerPatch;

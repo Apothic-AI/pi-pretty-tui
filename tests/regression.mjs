@@ -4051,9 +4051,9 @@ if (typeof InteractiveMode.prototype.maybeShowCacheMissNotice === "function") {
 // that range, and typing or pasting replaces it.
 {
   await emit("session_start", {}, sessionContext([]));
-  const composerFixture = (text, columns = 60, clickCount = 1) => {
+  const composerFixture = (text, columns = 60, clickCount = 1, EditorClass = CustomEditor) => {
     const tui = { terminal: { rows: 36, columns }, requestRender() {} };
-    const editor = new CustomEditor(tui, { ...theme, borderColor: (value) => value },
+    const editor = new EditorClass(tui, { ...theme, borderColor: (value) => value },
       new KeybindingsManager(TUI_KEYBINDINGS));
     editor.setText(text);
     // Render through the patched frame so the fixture layout has the live
@@ -4129,6 +4129,34 @@ if (typeof InteractiveMode.prototype.maybeShowCacheMissNotice === "function") {
     pasted.editor.undo();
     assert.equal(pasted.editor.getText(), "alpha beta", "replacement paste was not one undo step");
     console.log("Composer selection replaced by typing, Delete, and paste.");
+  }
+
+  // An extension that owns the editor may intercept bracketed paste in its own
+  // handleInput and insert through insertTextAtCursorInternal, never reaching
+  // handlePaste — pi-double-paste works exactly this way. The selection must
+  // still be replaced; otherwise it silently survives and a later Backspace
+  // deletes text the user no longer has selected.
+  {
+    class InterceptingPasteEditor extends CustomEditor {
+      handleInput(data) {
+        if (data.includes("\x1b[200~") && data.includes("\x1b[201~")) {
+          this.insertTextAtCursorInternal("[paste #9 +20 lines]");
+          return;
+        }
+        super.handleInput(data);
+      }
+    }
+    const fixture = composerFixture("alpha beta", 60, 1, InterceptingPasteEditor);
+    fixture.drag(fixture.cell(0), fixture.cell(4));
+    fixture.editor.handleInput("\x1b[200~many lines\x1b[201~");
+    assert.equal(fixture.editor.getText(), "[paste #9 +20 lines] beta",
+      "an intercepted paste did not replace the selection");
+    assert.equal(fixture.screen.selectionAnchor, undefined,
+      "the highlight survived an intercepted paste");
+    fixture.editor.undo();
+    assert.equal(fixture.editor.getText(), "alpha beta",
+      "replacing via an intercepted paste was not one undo step");
+    console.log("Composer selection replaced by an editor-extension paste.");
   }
 
   // A selection spanning a logical line break deletes the newline too, and a
