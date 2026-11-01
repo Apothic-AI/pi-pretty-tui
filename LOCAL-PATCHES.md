@@ -1,17 +1,23 @@
 # Local fork of `pi-pretty-tui`
 
-Vendored copy of [`pi-pretty-tui`](https://github.com/ykn0309/pi-pretty-tui) `@ 0.3.0`,
-tracked in `~/.pi/agent/settings.json` as a local path package:
+Fork of [`pi-pretty-tui`](https://github.com/ykn0309/pi-pretty-tui), loaded by
+`~/.pi/agent/settings.json` as a `git:` package:
 
 ```
-"../../Code/apothic-monorepo-workspace/tooling/pi-pretty-tui"
+"git:github.com/Apothic-AI/pi-pretty-tui@test/composer-selection-on-apothic"
 ```
 
-It exists because the npm release cannot coexist with
-[bizzy](../bizzy) (background tasks), which is also installed in the same agent.
+Pi resolves that into `~/.pi/agent/git/github.com/Apothic-AI/pi-pretty-tui`, which is the
+tree this agent actually runs. A second checkout of the same repository lives at
+`../../apothic-monorepo-workspace/tooling/pi-pretty-tui` (the `apothic` bookmark); it is the
+integration target, not the loaded extension.
 
-Current base: `0.3.0` (the release whose development baseline is Pi 1.3.0). It loads and
-renders on Pi 1.4.0, which is what this agent runs.
+The fork exists because the npm release could not coexist with [bizzy](../bizzy) (background
+tasks), which is also installed in the same agent. That specific incompatibility is fixed
+upstream as of `bb5d805`, so the fork now carries features rather than a coexistence patch.
+
+Baseline: `0.3.0` plus the upstream `bb5d805` merge (`prep/apothic-upstream-merge`), verified
+on Pi 1.4.0.
 
 ## The conflict
 
@@ -52,49 +58,21 @@ only how that tool draws:
   prompt guidelines, and execution are untouched;
 - every other tool resolves exactly as before.
 
-Two pieces, both in `extensions/index.ts`:
+Upstream supplies this now. `bb5d805` (upstream PR #3) implements the render-only mechanism
+inside `registerStyledTool` itself and goes further: it marks non-builtin `sourceInfo.path`
+values with `THIRD_PARTY_TOOL`, so a third-party tool stays recognisable after the renderer
+resolver runs. Our own `registerRenderedTool` was the same mechanism with less scope, so it
+was **retired rather than reconciled**: reverting it is precisely what makes the upstream
+merge clean instead of conflicted.
 
-1. A helper above `export default function prettyTui`:
+Nothing in this fork patches tool registration any more. `extensions/index.ts` calls
+`pi.registerToolRenderer` exactly as upstream ships it, and the fork's own patches are the
+composer-selection feature (#7) and the selection frame-chrome fix (#5).
 
-   ```ts
-   function registerRenderedTool(pi: ExtensionAPI, tool: { name?: string }, renderers: ToolRenderers): void {
-     const toolName = tool.name;
-     if (!toolName) throw new Error("registerRenderedTool needs a named tool definition");
-     pi.registerToolRenderer((name, next) =>
-       name === toolName ? { ...next(), ...renderers } : next(),
-     );
-   }
-   ```
-
-   The `{ ...next(), ...renderers }` merge is required, not cosmetic: the resolver's return
-   value *is* the definition Pi renders with, so returning our renderers alone drops the
-   owner's `name`, `description`, `parameters`, `label`, and any extra fields.
-
-2. Upstream `0.3.0` funnels all seven built-ins (`read`, `bash`, `edit`, `write`, `grep`,
-   `find`, `ls`) through one `registerStyledTool(definition)` helper, so the patch is a
-   single call site: its `pi.registerTool({ ...definition, renderCall, renderResult })`
-   becomes
-
-   ```ts
-   registerRenderedTool(pi, definition, {
-     ...(definition.renderShell ? { renderShell: definition.renderShell } : {}),
-     renderCall: (...args: any[]) => select("renderCall", args),
-     renderResult: (...args: any[]) => select("renderResult", args),
-   });
-   ```
-
-   `ToolRenderers` is `Pick<ToolDefinition, "renderShell" | "renderCall" | "renderResult">`,
-   so the native/pretty `select()` swap keeps working unchanged.
-
-The `0.2.8` base needed the same helper wired into seven separate call sites; `0.3.0`'s
-refactor into `registerStyledTool` collapsed them into one, so this patch is now smaller than
-it was.
-
-Verified against Pi 1.4.0 by loading both extensions through Pi's real `loadExtensions()`:
-pretty-tui contributes 7 renderer resolvers and **0** tools, bizzy keeps
-`bash`, `bash_bg`, `jobs`, `agent_bg`, `monitor`, `detectExtensionConflicts` reports nothing,
-and `read`/`bash`/`edit`/`write`/`grep`/`find`/`ls` resolve to pretty-tui renderers with
-`renderShell: self` while `codemode` and everything else falls through to its owner.
+Verified against Pi 1.4.0 on the merged tree with upstream's own `tests/coexistence.mjs`
+(real `loadExtensions`, no model): pretty-tui contributes renderer resolvers and **0** tools,
+the stand-in owner keeps its `bash` schema and `run_in_background` parameter, and the
+resolvers chain instead of colliding. `npm test` is green on the merge.
 
 ## Upgrading from npm
 
@@ -107,11 +85,8 @@ and `read`/`bash`/`edit`/`write`/`grep`/`find`/`ls` resolve to pretty-tui render
    cp /tmp/package/package.json /tmp/package/README*.md /tmp/package/LICENSE .
    ```
 
-2. Re-apply the patch: add `type ToolRenderers` to the `@earendil-works/pi-coding-agent`
-   import, add the `registerRenderedTool` helper above `export default function prettyTui`,
-   and swap the `pi.registerTool(...)` call inside `registerStyledTool` for
-   `registerRenderedTool(...)` as shown above. If a release ever reintroduces a direct
-   `pi.registerTool` for one of the seven built-ins, convert that call site the same way.
+2. Nothing to re-apply: a release that already contains `bb5d805` carries the render-only
+   mechanism. Only re-apply the composer-selection work (#7) if the release predates it.
 
 3. Typecheck. The npm tarball ships no `tsconfig.json` and no `node_modules`, so this
    vendored copy carries its own `tsconfig.json` and `tsc` needs the Pi packages plus
