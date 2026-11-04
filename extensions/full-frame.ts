@@ -1,3 +1,4 @@
+import { selectableRow, selectionMetadataActive } from "./selection-ranges.js";
 import { cardSurface } from "./card-surface.js";
 import { isNativeImageRow, stripAnsiBackgrounds } from "./ansi-style.js";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -44,7 +45,7 @@ function renderPanel(
 ): NativeFrame {
   const palette = ["borderMuted", "text", "accent", "success", "error", titleColor, borderColor]
     .map((role) => theme.fg(role, "x")).join("|") + (theme.bold?.("x") ?? "x") +
-    cardSurface(theme, borderColor, background).signature;
+    cardSurface(theme, borderColor, background).signature + selectionMetadataActive();
   const sectionKey = titleColor + borderColor + footer + background + JSON.stringify([...sections]);
   const cached = cacheOwner ? frameCache.get(cacheOwner) : undefined;
   if (cached && cached.title === title && cached.width === width && cached.palette === palette && cached.sections === sectionKey &&
@@ -52,15 +53,13 @@ function renderPanel(
   const sourceRows = new Map<number, number>();
   if (width < 8) {
     source.forEach((_, y) => sourceRows.set(y, y));
-    return {
-      lines: source.map((row) => cardBackground(row, width, theme, background, borderColor)),
-      sourceRows, contentWidth: Math.max(1, width), inset: 0,
-    };
+    return { lines: source.map((row) => cardBackground(row, width, theme, background, borderColor)), sourceRows, contentWidth: Math.max(1, width), inset: 0 };
   }
   const contentWidth = width - 4;
   const border = (s: string) => theme.fg(borderColor, s);
   const plainCaption = truncateToWidth(title, width - 6, "…");
   const caption = theme.fg(titleColor, theme.bold?.(plainCaption) ?? plainCaption);
+  const copyRanges: Array<Array<[number, number]>> | undefined = selectionMetadataActive() ? [[]] : undefined;
   const lines = [border("╭─ ") + caption + border(" " + "─".repeat(Math.max(0, width - visibleWidth(plainCaption) - 5)) + "╮")];
   source.forEach((row, sourceY) => {
     const section = sections.get(sourceY);
@@ -69,19 +68,28 @@ function renderPanel(
       const label = theme.fg(section.color, plainLabel);
       sourceRows.set(lines.length, sourceY);
       lines.push(border("├─ ") + label + border(" " + "─".repeat(Math.max(0, width - visibleWidth(plainLabel) - 5)) + "┤"));
+      copyRanges?.push([]);
     }
     sourceRows.set(lines.length, sourceY);
-    if (isNativeImageRow(row)) lines.push(row);
+    if (isNativeImageRow(row)) { lines.push(row); copyRanges?.push([]); }
     else {
       const content = stripAnsiBackgrounds(row);
-      lines.push(border("│ ") + content + " ".repeat(Math.max(0, contentWidth - visibleWidth(content))) + border(" │"));
+      const length = visibleWidth(content);
+      lines.push(border("│ ") + content + " ".repeat(Math.max(0, contentWidth - length)) + border(" │"));
+      copyRanges?.push([[2, 2 + Math.max(1, Math.min(contentWidth, length))]]);
     }
   });
   const footerFits = footer && visibleWidth(footer) + 6 <= width;
   lines.push(footerFits
     ? border("╰" + "─".repeat(width - visibleWidth(footer) - 5) + " " + footer + " ─╯")
     : border("╰" + "─".repeat(width - 2) + "╯"));
-  const frame = { lines: lines.map((line) => cardBackground(line, width, theme, background, borderColor)), sourceRows, contentWidth, inset: 2 };
+  copyRanges?.push([]);
+  // Apply backgrounds before adding this frame's annotations so the width
+  // cache doesn't retain an extra marked variant of every newly painted row.
+  const frame = { lines: lines.map((line, i) => {
+    const painted = cardBackground(line, width, theme, background, borderColor);
+    return copyRanges ? selectableRow(painted, width, copyRanges[i]) : painted;
+  }), sourceRows, contentWidth, inset: 2 };
   if (cacheOwner) frameCache.set(cacheOwner, { title, source: source.slice(), width, palette, sections: sectionKey, frame });
   return frame;
 }
@@ -100,10 +108,8 @@ export function frameNativeRows(
   if (!margin) return frame;
   const cached = gutterFrames.get(frame);
   if (cached) return cached;
-  // Outer gutters are chrome on both sides, so the frame keeps the same line
-  // indices and the copy clamp widens by the margin on each side.
   const padded = { ...frame, inset: frame.inset + margin,
-    lines: frame.lines.map((line) => isNativeImageRow(line) ? line : " ".repeat(margin) + line + " ".repeat(margin)),
+    lines: frame.lines.map((line) => isNativeImageRow(line) ? line : selectableRow(" ".repeat(margin) + line + " ".repeat(margin), width, [[margin, width - margin]])),
   };
   gutterFrames.set(frame, padded);
   return padded;

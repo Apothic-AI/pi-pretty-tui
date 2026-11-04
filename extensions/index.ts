@@ -1,6 +1,13 @@
+import { installSelectionCopy, selectableRow, selectionMetadataActive } from "./selection-ranges.js";
 import { isNativeImageRow } from "./ansi-style.js";
 import { cardMargin, cardBackground, frameNativeRows, nativeFrameWidth } from "./full-frame.js";
-import { selectionText } from "./selection-chrome.js";
+import {
+  themedInlineContext,
+  withNativeEmphasis,
+  type InlineStyleContext,
+  type InlineToken,
+} from "./markdown-emphasis.js";
+import { gapRowsAfterBlock, renderSpacedList } from "./markdown-spacing.js";
 import { ThoughtPresentation } from "./thought-presentation.js";
 import { isThirdPartyTool, renderToolProjection, THIRD_PARTY_TOOL, toolLabel, type ToolProjection } from "./tool-presentation.js";
 import { NestedTools, NESTED_SNAPSHOT_ENTRY } from "./nested-tools.js";
@@ -63,6 +70,10 @@ const RESPONSE_FOOTER_ENTRY_TYPE = "pretty-tui-response-footer";
 type PrettyTuiConfig = {
   enabled?: boolean;
   mode?: PrettyTuiMode;
+  /** Exclude plugin decoration from fullscreen selections. Opt-in. */
+  selectionCopy?: boolean;
+  /** "native" keeps Pi's flags-only strong and emphasis. Read when the extension loads. */
+  markdownEmphasis?: "themed" | "native";
   /** Legacy location used by the first mode implementation. */
   bash?: {
     mode?: "full" | "compact";
@@ -76,6 +87,24 @@ const loadConfig = (path: string): PrettyTuiConfig => {
   } catch {
     return {};
   }
+};
+
+/** Stable text affixes around opaque IDs, without fuzzy similarity chaining. */
+const errorAffixKey = (text: string): string => {
+  const parts: (string | ["hex" | "uuid"])[] = [];
+  let cursor = 0;
+  // Whole tokens only: keep semantic identifiers such as msg_<hex> and
+  // rs_<hex>, short codes, ordinary words, and numeric quantities exact.
+  const opaqueId = /(?<![\w-])(?:[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}|[\da-f]{16,128})(?![\w-])/giu;
+  for (const match of text.matchAll(opaqueId)) {
+    const kind = match[0].includes("-") ? "uuid" : "hex";
+    if (kind === "hex" && !/[a-f]/iu.test(match[0])) continue;
+    parts.push(text.slice(cursor, match.index), [kind]);
+    cursor = match.index + match[0].length;
+  }
+  parts.push(text.slice(cursor));
+  // Typed slots cannot collide with a literal placeholder in an error.
+  return JSON.stringify(parts);
 };
 
 /** Polished user messages, tool calls, and list rendering for Pi's TUI. */
@@ -100,6 +129,21 @@ export default function prettyTui(pi: ExtensionAPI) {
   let currentPromptEditor: any;
   let errorChatContainer: any;
   const runtimeErrorDescriptors = new WeakMap<object, { source: string; title: string; content: string }>();
+  const expandedErrorRuns = new WeakSet<object>();
+  const errorDisclosureRows = new WeakMap<object, { start: number; end: number }>();
+  const errorDisclosureHit = (component: object, event: any) => {
+    const rows = errorDisclosureRows.get(component);
+    return renderMode !== "full" && Boolean(rows && event.y >= rows.start && event.y < rows.end);
+  };
+  const handleErrorDisclosureMouse = (component: object, event: any) => {
+    if (event.button !== "left" || !errorDisclosureHit(component, event)) return undefined;
+    if (event.type === "press") return { handled: true };
+    if (event.type !== "click") return undefined;
+    if (expandedErrorRuns.has(component)) expandedErrorRuns.delete(component);
+    else expandedErrorRuns.add(component);
+    currentTui?.requestRender?.();
+    return { handled: true };
+  };
   const errorDescriptor = (component: any) => {
     const runtime = runtimeErrorDescriptors.get(component);
     if (runtime) return runtime;
@@ -113,15 +157,21 @@ export default function prettyTui(pi: ExtensionAPI) {
     const children: any[] = errorChatContainer?.children ?? [];
     const index = children.indexOf(component);
     const descriptor = errorDescriptor(component);
+    const key = descriptor && errorAffixKey(descriptor.content);
     const same = (other: any) => {
       const value = errorDescriptor(other);
       return descriptor && value && value.source === descriptor.source &&
-        value.title === descriptor.title && value.content === descriptor.content;
+        value.title === descriptor.title && errorAffixKey(value.content) === key;
     };
     if (index < 0 || !descriptor) return { hidden: false, count: 1, compact: false };
+    // Only the visible run head needs a count; hidden retries must not rescan
+    // the whole suffix and repeatedly fingerprint every later error.
+    const hidden = index > 0 && Boolean(same(children[index - 1]));
     let count = 1;
-    while (index + count < children.length && same(children[index + count])) count++;
-    return { hidden: index > 0 && Boolean(same(children[index - 1])), count,
+    if (!hidden) {
+      while (index + count < children.length && same(children[index + count])) count++;
+    }
+    return { hidden, count,
       compact: index > 0 && Boolean(errorDescriptor(children[index - 1])) };
   };
   const runningColor = (theme: any, text: string): string =>
@@ -301,6 +351,17 @@ export default function prettyTui(pi: ExtensionAPI) {
     }
   };
   const transcriptMarkdownActive = () => transcriptMarkdownDepth > 0;
+  // Assistant answers only. The transcript scope also covers user messages,
+  // thinking and activity updates, which keep Pi's strong and emphasis styling.
+  const assistantBodyMarkdown = new WeakSet<object>();
+  const markAssistantBodyMarkdown = (component: any) => {
+    // Pi adds answer text directly; a thought block is wrapped in a MouseRegion.
+    // A component built before this runtime is covered too: the rendered-mode
+    // symbols are per runtime, so its first render here re-runs updateContent.
+    for (const child of component.contentContainer?.children ?? []) {
+      if (child instanceof Markdown && !(child as any).defaultTextStyle) assistantBodyMarkdown.add(child);
+    }
+  };
 
   const setCleanGroupMembers = (lastToolCallId: string, toolCallIds: string[]) => {
     cleanGroupToolCallIds.set(lastToolCallId, toolCallIds);
@@ -583,23 +644,45 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const renderStandaloneError = (member: ActivityMember, width: number, component?: any): string[] => {
     const run = component && renderMode !== "full" ? errorRun(component) : { hidden: false, count: 1, compact: false };
+    if (component) errorDisclosureRows.delete(component);
     if (run.hidden) return [];
     const theme = defaultActivityTheme();
     const style = activityUpdateStyle(member, theme);
     const original = component ? errorDescriptor(component) : undefined;
-    const title = stripTerminalSequences(original?.title ?? member.updateTitle ?? "Error");
-    const content = stripTerminalSequences(original?.content || member.updateContent || "");
-    const heading = style.icon + style.title(title);
-    const prefix = heading + (content ? theme.fg("dim", " · ") : "");
-    const text = prefix + theme.fg("muted", content) + (run.count > 1 ? theme.fg("dim", ` ×${run.count}`) : "");
-    // Wrap rather than truncate; all original detail lines remain accessible.
-    const continuation = " ".repeat(Math.min(visibleWidth(prefix), Math.max(0, Math.floor(width / 3))));
-    const rows: string[] = [];
-    for (const line of text.split("\n")) {
-      const wrapped = wrapTextWithAnsi(line, Math.max(1, width - visibleWidth(continuation)));
-      rows.push(...wrapped.map((row, index) => (rows.length || index ? continuation : "") + row));
+    const renderError = (titleText: string, contentText: string, count = 1): string[] => {
+      const title = stripTerminalSequences(titleText);
+      const content = stripTerminalSequences(contentText);
+      const heading = style.icon + style.title(title);
+      const prefix = heading + (content ? theme.fg("dim", " · ") : "");
+      const text = prefix + theme.fg("muted", content) + (count > 1 ? theme.fg("dim", component && expandedErrorRuns.has(component) ? " [Collapse]" : ` [×${count}]`) : "");
+      // Wrap rather than truncate; all original detail lines remain accessible.
+      const continuation = " ".repeat(Math.min(visibleWidth(prefix), Math.max(0, Math.floor(width / 3))));
+      const rows: string[] = [];
+      for (const line of text.split("\n")) {
+        const wrapped = wrapTextWithAnsi(line, Math.max(1, width - visibleWidth(continuation)));
+        rows.push(...wrapped.map((row, index) => (rows.length || index ? continuation : "") + row));
+      }
+      return rows.map((line) => truncateToWidth(line, Math.max(1, width), ""));
+    };
+    const rows = [
+      ...(run.compact ? [] : [""]),
+      ...renderError(original?.title ?? member.updateTitle ?? "Error", original?.content || member.updateContent || "", run.count),
+    ];
+    if (component && run.count > 1) {
+      errorDisclosureRows.set(component, { start: run.compact ? 0 : 1, end: rows.length });
+      mouseClickHitTests.set(component, (event) => errorDisclosureHit(component, event));
+      if (expandedErrorRuns.has(component)) {
+        // The visible head owns the expanded projection. Original retry
+        // components stay untouched and hidden, and only the head counts them.
+        const children = errorChatContainer?.children ?? [];
+        const index = children.indexOf(component);
+        for (const retry of children.slice(index + 1, index + run.count)) {
+          const descriptor = errorDescriptor(retry);
+          if (descriptor) rows.push(...renderError(descriptor.title, descriptor.content));
+        }
+      }
     }
-    return [...(run.compact ? [] : [""]), ...rows.map((line) => truncateToWidth(line, Math.max(1, width), ""))];
+    return rows;
   };
 
   const renderPendingActivityUpdate = (member: ActivityMember, width: number, component?: any): string[] => {
@@ -677,7 +760,9 @@ export default function prettyTui(pi: ExtensionAPI) {
         { value: "full", label: "full", description: "Full tool details and output" },
         { value: "compact", label: "compact", description: "Concise summaries for all built-in tools" },
         { value: "clean", label: "clean", description: "Group supported tools into Running/Done status" },
-        { value: "status", label: "status", description: "Show the current mode" },
+        { value: "selection-copy on", label: "selection-copy on", description: "Copy selected text without UI borders in fullscreen mode; enable and reload" },
+        { value: "selection-copy off", label: "selection-copy off", description: "Restore native selection copying and reload" },
+        { value: "status", label: "status", description: "Show the current settings" },
       ];
       const filtered = items.filter((item) => item.value.startsWith(prefix.trim().toLowerCase()));
       return filtered.length > 0 ? filtered : null;
@@ -688,7 +773,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (!requested) {
         if (!ctx.hasUI) {
           ctx.ui.notify(
-            `pi-pretty-tui: ${config.enabled !== false ? "enabled" : "disabled"} · mode: ${renderMode}`,
+            `pi-pretty-tui: ${config.enabled !== false ? "enabled" : "disabled"} · mode: ${renderMode} · selection copy: ${config.selectionCopy === true ? "on" : "off"}`,
             "info",
           );
           return;
@@ -697,9 +782,12 @@ export default function prettyTui(pi: ExtensionAPI) {
         const full = `Full — full tool details and output${renderMode === "full" ? " (current)" : ""}`;
         const compact = `Compact — concise tool summaries and nested calls${renderMode === "compact" ? " (current)" : ""}`;
         const clean = `Clean — group supported tools into Running/Done status${renderMode === "clean" ? " (current)" : ""}`;
-        const selected = await ctx.ui.select("pi-pretty-tui settings", [enabled, full, compact, clean]);
+        const selectionCopy = `Selection copy — ${config.selectionCopy === true ? "on" : "off"} · copy text without UI borders (fullscreen, experimental)`;
+        const selected = await ctx.ui.select("pi-pretty-tui settings", [enabled, full, compact, clean, selectionCopy]);
         if (!selected) return;
-        requested = selected === enabled
+        requested = selected === selectionCopy
+          ? config.selectionCopy === true ? "selection-copy off" : "selection-copy on"
+          : selected === enabled
           ? config.enabled !== false ? "disable" : "enable"
           : selected === full
             ? "full"
@@ -710,9 +798,26 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       if (requested === "status") {
         ctx.ui.notify(
-          `pi-pretty-tui: ${config.enabled !== false ? "enabled" : "disabled"} · mode: ${renderMode}`,
+          `pi-pretty-tui: ${config.enabled !== false ? "enabled" : "disabled"} · mode: ${renderMode} · selection copy: ${config.selectionCopy === true ? "on" : "off"}`,
           "info",
         );
+        return;
+      }
+      if (requested === "selection-copy on" || requested === "selection-copy off") {
+        const selectionCopy = requested.endsWith(" on");
+        try {
+          saveConfig({ ...config, selectionCopy });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Could not save selection-copy setting: ${message}`, "error");
+          return;
+        }
+        ctx.ui.notify(`Border-free selection copying ${selectionCopy ? "enabled" : "disabled"}; reloading…`, "info");
+        try { await ctx.reload(); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Setting saved, but automatic reload failed: ${message}`, "warning");
+        }
         return;
       }
       if (requested === "enable" || requested === "disable") {
@@ -738,7 +843,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         }
       }
       if (requested !== "full" && requested !== "compact" && requested !== "clean") {
-        ctx.ui.notify("Usage: /pretty-tui [enable|disable|full|compact|clean|status]", "error");
+        ctx.ui.notify("Usage: /pretty-tui [enable|disable|full|compact|clean|status|selection-copy on|selection-copy off]", "error");
         return;
       }
 
@@ -765,6 +870,7 @@ export default function prettyTui(pi: ExtensionAPI) {
   // render patches or override built-in tools until the next enabled reload.
   if (!activeForSession) return;
   pi.on("session_shutdown", stopWorkingElapsedTimer);
+  if (config.selectionCopy === true) pi.on("session_shutdown", installSelectionCopy());
 
   // Give Pi's main prompt editor a complete rounded frame. Render the native
   // editor at a two-column narrower width so cursor layout, wrapping, IME, and
@@ -811,15 +917,14 @@ export default function prettyTui(pi: ExtensionAPI) {
       const fitInnerWidth = (line: string) =>
         line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
 
-      const rendered = lines.map((line, index) => {
+      return lines.map((line, index) => {
         const fitted = fitInnerWidth(line);
-        if (index === 0) return this.borderColor("╭") + fitted + this.borderColor("╮");
-        if (index === bottomBorderIndex) return this.borderColor("╰") + fitted + this.borderColor("╯");
-        if (index < bottomBorderIndex) return this.borderColor("│") + fitted + this.borderColor("│");
+        if (index === 0) return selectableRow(this.borderColor("╭") + fitted + this.borderColor("╮"), width, []);
+        if (index === bottomBorderIndex) return selectableRow(this.borderColor("╰") + fitted + this.borderColor("╯"), width, []);
+        if (index < bottomBorderIndex) return selectableRow(this.borderColor("│") + fitted + this.borderColor("│"), width, [[1, width - 1]]);
         // Autocomplete remains outside the input frame, aligned to its content.
         return " " + fitted + " ";
       });
-      return rendered;
     };
     const patchedEditorHandleMouse = function (this: any, event: any) {
       if (event.width < 3) return originalEditorHandleMouse.call(this, event);
@@ -880,9 +985,6 @@ export default function prettyTui(pi: ExtensionAPI) {
       originalUserMessageRebuild.call(this);
       const content = this.children?.[0] as any;
       if (!content) return;
-      // Pi lays out the message component, not the frame wrapper it creates, so
-      // chrome the frame records has to be reachable from the message too.
-      const messageOwner = this;
 
       // Remove Pi's full-width user-message background. The Markdown keeps its
       // native foreground styling, while the surrounding bubble stays transparent.
@@ -977,28 +1079,18 @@ export default function prettyTui(pi: ExtensionAPI) {
               ? cardBackground(line, width, defaultActivityTheme(), "toolPendingBg", "mdHeading") : left + line + right);
           }
           if (renderMode !== "clean") {
-            const native = frameNativeRows("User", measured.body, width, defaultActivityTheme(), undefined,
-              frame, "mdHeading", "", "mdHeading");
-            return native.lines;
+            return frameNativeRows("User", measured.body, width, defaultActivityTheme(), undefined,
+              frame, "mdHeading", "", "mdHeading").lines;
           }
 
           const top = border("╭" + "─".repeat(Math.max(0, measured.frameWidth - 2)) + "╮");
           const bottom = border("╰" + "─".repeat(Math.max(0, measured.frameWidth - 2)) + "╯");
           const body = measured.body.map((line: string) => {
             const padding = " ".repeat(Math.max(0, measured.contentWidth - visibleWidth(line)));
-            return border("│ ") + line + padding + border(" │");
+            return selectableRow(border("│ ") + line + padding + border(" │"), measured.frameWidth, [[2, 2 + Math.max(1, Math.min(measured.contentWidth, visibleWidth(line)))]]);
           });
-          // The rule rows and both gutters are chrome; the selection clamps to
-          // the content between them, offset by the bubble's outer padding.
-          // Rebuild the closure per render, never memoize it: it closes over the
-          // geometry of the width it was created for, and a re-render at another
-          // width (or after the text changed) would clamp against stale columns.
-          const cleanChrome = (rowIndex: number) => {
-            if (rowIndex === 0 || rowIndex === measured.body.length + 1) return "frame";
-            if (rowIndex > measured.body.length + 1) return undefined;
-            return { left: measured.leftPad + 2, right: measured.rightPad + 2 };
-          };
-          return [top, ...body, bottom].map((line: string) => left + line + right);
+          return [selectableRow(top, measured.frameWidth, []), ...body, selectableRow(bottom, measured.frameWidth, [])]
+            .map((line: string) => selectableRow(left + line + right, width, [[measured.leftPad, width - measured.rightPad]]));
         },
         handleMouse(event: any) {
           const measured = layout(event.width);
@@ -1374,10 +1466,15 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
       if (renderMode === "compact") {
         const terminal = assistantTerminalUpdate(this[originalMessageKey] ?? this.lastMessage);
-        if (terminal) output.push(...renderPendingActivityUpdate(terminal, width, this));
+        if (terminal) {
+          const offset = output.length;
+          output.push(...renderPendingActivityUpdate(terminal, width, this));
+          const disclosure = errorDisclosureRows.get(this);
+          if (disclosure) errorDisclosureRows.set(this, { start: disclosure.start + offset, end: disclosure.end + offset });
+        }
       }
       panelAssistantViews.set(this, { rows, width: innerWidth, height: nativeLines.length });
-      mouseClickHitTests.set(this, (event) => thoughtRows.has(event.y));
+      mouseClickHitTests.set(this, (event) => thoughtRows.has(event.y) || errorDisclosureHit(this, event));
       return renderMode === "compact" && width < 8
         ? output.map((line) => isNativeImageRow(line) ? line : truncateToWidth(line, Math.max(1, width), "")) : output;
     };
@@ -1394,6 +1491,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         originalUpdateContent.call(this, renderMode === "compact" && assistantTerminalState(message)
           ? { ...message, errorMessage: undefined, stopReason: "stop" } : message, isStreaming);
         this.lastMessage = message;
+        markAssistantBodyMarkdown(this);
         if (eligibleThinking(message)) thinkingComponents.set(assistantMessageKey(message), this);
         return;
       }
@@ -1421,9 +1519,11 @@ export default function prettyTui(pi: ExtensionAPI) {
         this.hideThinkingBlock = previousHideThinkingBlock;
       }
       this.lastMessage = message;
+      markAssistantBodyMarkdown(this);
     };
 
     const renderAssistantTranscript = function (this: any, width: number): string[] {
+      errorDisclosureRows.delete(this);
       const message = this[originalMessageKey] ?? this.lastMessage;
       if (
         message &&
@@ -1549,6 +1649,11 @@ export default function prettyTui(pi: ExtensionAPI) {
     };
 
     const handleAssistantTranscriptMouse = function (this: any, event: any) {
+      if (errorDescriptor(this)) {
+        patchedRender.call(this, event.width);
+        const disclosure = handleErrorDisclosureMouse(this, event);
+        if (disclosure) return disclosure;
+      }
       const message = this[originalMessageKey] ?? this.lastMessage;
       if (renderMode !== "clean") {
         patchedRender.call(this, event.width);
@@ -1717,7 +1822,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     const component: Component = {
       render: (width: number) => renderActivityUpdateProjection(group, member, width, component),
       invalidate() {},
-      handleMouse: (event: any) => handleActivityUpdateMouse(group, member, event),
+      handleMouse: (event: any) => handleErrorDisclosureMouse(component, event) ?? handleActivityUpdateMouse(group, member, event),
     } as Component;
     if (severity === "error") runtimeErrorDescriptors.set(component, {
       source: "runtime:error", title, content,
@@ -2270,36 +2375,6 @@ export default function prettyTui(pi: ExtensionAPI) {
     });
   }
 
-  // Copying a selection must not carry our frames into the clipboard. Pi builds
-  // copied text from the rendered buffer, so clamp it to the chrome recorded by
-  // the renderers above. Patching the instance method (not the prototype) keeps
-  // the host's own copy path intact for every screen without our chrome.
-  const selectionCopyPatchKey = Symbol.for("pretty-tui.selection-copy");
-  {
-    const originalGetActiveSelectionText = altScreenPrototype.getActiveSelectionText;
-    // Pi's text is authoritative about what was selected; the only thing wrong
-    // with it is the frame art it carries, so post-process that away.
-    const patchedGetActiveSelectionText = function (this: any) {
-      const text = originalGetActiveSelectionText.call(this);
-      return typeof text === "string" ? selectionText(text) : text;
-    };
-    altScreenPrototype[selectionCopyPatchKey] = {
-      originalGetActiveSelectionText,
-      patchedGetActiveSelectionText,
-    };
-    altScreenPrototype.getActiveSelectionText = patchedGetActiveSelectionText;
-
-    pi.on("session_shutdown", () => {
-      const patch = altScreenPrototype[selectionCopyPatchKey];
-      if (patch?.patchedGetActiveSelectionText === altScreenPrototype.getActiveSelectionText) {
-        altScreenPrototype.getActiveSelectionText = patch.originalGetActiveSelectionText;
-      }
-      if (patch && altScreenPrototype.getActiveSelectionText === patch.originalGetActiveSelectionText) {
-        delete altScreenPrototype[selectionCopyPatchKey];
-      }
-    });
-  }
-
   // Refine Pi's Markdown presentation while preserving its parser and themes.
   const markdownPrototype = Markdown.prototype as any;
   const codeBlockPatchKey = Symbol.for("pretty-tui.code-blocks");
@@ -2307,6 +2382,11 @@ export default function prettyTui(pi: ExtensionAPI) {
   const codeBlockRegionsKey = Symbol("pretty-tui.code-block-regions");
   const transcriptMarkdownStateKey = Symbol("pretty-tui.transcript-markdown-state");
   if (!markdownPrototype[codeBlockPatchKey]) {
+    // Pi 1.5 reuses rendered top-level blocks while text streams. Keep copy
+    // descriptors with each native block's highlighting-cache identity, weakly,
+    // so reused pixels retain their hit regions without disabling that cache.
+    const blockCopyDescriptors = new WeakMap<object, { generation: number; blocks: any[] }>();
+    let copyRenderGeneration = 0;
     const originalInvalidate = markdownPrototype.invalidate;
     const originalRender = markdownPrototype.render;
     const originalRenderToken = markdownPrototype.renderToken;
@@ -2318,6 +2398,21 @@ export default function prettyTui(pi: ExtensionAPI) {
       delete this[codeBlockCollectionKey];
       delete this[codeBlockRegionsKey];
       return originalInvalidate.call(this);
+    };
+
+    const copyRows = new WeakMap<object, { source: string[]; padding: number; lines: string[] }>();
+    const selectableMarkdown = (owner: any, source: string[]) => {
+      if (!selectionMetadataActive()) return source;
+      const padding = Math.max(0, Number(owner.paddingX) || 0);
+      if (!padding) return source;
+      const cached = copyRows.get(owner);
+      if (cached?.source === source && cached.padding === padding) return cached.lines;
+      const lines = source.map(line => {
+        const width = visibleWidth(line);
+        return selectableRow(line, width, [[Math.min(padding, width), Math.max(Math.min(padding, width), width - padding)]]);
+      });
+      copyRows.set(owner, { source, padding, lines });
+      return lines;
     };
 
     const patchedRender = function (this: any, width: number): string[] {
@@ -2336,14 +2431,22 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       const needsRender =
         !this.cachedLines || this.cachedText !== this.text || this.cachedWidth !== width;
-      if (needsRender) this[codeBlockCollectionKey] = [];
+      if (needsRender) this[codeBlockCollectionKey] = Object.assign([], { generation: ++copyRenderGeneration });
 
       const lines = originalRender.call(this, width);
-      if (!needsRender) return lines;
+      if (!needsRender) return selectableMarkdown(this, lines);
 
       const regions: Array<{ xStart: number; xEnd: number; y: number; code: string }> = [];
       let searchFrom = 0;
-      for (const block of this[codeBlockCollectionKey] ?? []) {
+      const nativeBlocks = this.blocks?.deref();
+      const nativeTokens = this.cachedTokens?.deref()?.tokens;
+      const copyBlocks = nativeBlocks && nativeTokens
+        ? nativeTokens.flatMap((token: any) => {
+            const block = nativeBlocks.get(token.raw);
+            return block ? blockCopyDescriptors.get(block.highlightedCode)?.blocks ?? [] : [];
+          })
+        : this[codeBlockCollectionKey] ?? [];
+      for (const block of copyBlocks) {
         let headerLine = -1;
         for (let lineIndex = searchFrom; lineIndex < lines.length; lineIndex += 1) {
           const renderedLine = lines[lineIndex] ?? "";
@@ -2367,7 +2470,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
       this[codeBlockRegionsKey] = regions;
       delete this[codeBlockCollectionKey];
-      return lines;
+      return selectableMarkdown(this, lines);
     };
 
     const patchedRenderToken = function (
@@ -2389,36 +2492,20 @@ export default function prettyTui(pi: ExtensionAPI) {
           return lines;
         };
         const headingStyle = (text: string) => this.theme.heading(text);
-        const foregroundLuminance = (styled: string): number | undefined => {
-          const trueColor = /\x1b\[38;2;(\d+);(\d+);(\d+)m/.exec(styled);
-          if (!trueColor) return undefined;
-          const [, red, green, blue] = trueColor.map(Number);
-          return red * 0.2126 + green * 0.7152 + blue * 0.0722;
-        };
-        const defaultLuminance = foregroundLuminance(this.applyDefaultStyle("M"));
-        const headingLuminance = foregroundLuminance(headingStyle("M"));
-        const darkTheme =
-          defaultLuminance !== undefined
-            ? defaultLuminance >= 128
-            : (headingLuminance ?? 255) >= 160;
-        const whiteStyle = (text: string) => `\x1b[97m${text}\x1b[39m`;
+        // Descending emphasis: framed H1, underlined H2, bold H3,
+        // plain H4, decorative H5, and quote-colored italic H6.
         const titleStyle =
-          level === 1 || level === 3
+          level === 1 || level === 2
             ? (text: string) => headingStyle(this.theme.bold(this.theme.underline(text)))
-            : level === 2
-              ? (text: string) =>
-                  (darkTheme ? whiteStyle : headingStyle)(
-                    this.theme.bold(this.theme.underline(text)),
-                  )
-              : level === 4
-                ? (text: string) => headingStyle(this.theme.bold(text))
-                : level === 5
-                  ? headingStyle
-                  : (text: string) => this.theme.quote(this.theme.italic(text));
-        const titleContext = {
+            : level === 3
+              ? (text: string) => headingStyle(this.theme.bold(text))
+              : level === 4 || level === 5
+                ? headingStyle
+                : (text: string) => this.theme.quote(this.theme.italic(text));
+        const titleContext = withNativeEmphasis({
           applyText: titleStyle,
           stylePrefix: this.getStylePrefix(titleStyle),
-        };
+        });
         const title = this.renderInlineTokens(token.tokens || [], titleContext);
 
         if (level === 1 && maxWidth >= 6) {
@@ -2438,17 +2525,6 @@ export default function prettyTui(pi: ExtensionAPI) {
             }),
             frameStyle(`╚${"═".repeat(frameWidth - 2)}╝`),
           ];
-          return addHeadingSpacing(lines);
-        }
-
-        if (level === 2) {
-          // Reverse only the rendered title cells: the theme's heading color
-          // becomes a compact, content-width background label with no frame.
-          const lines = wrapTextWithAnsi(title, maxWidth).map((line: string) =>
-            darkTheme
-              ? `\x1b[48;5;94m${line}\x1b[49m`
-              : `\x1b[107m\x1b[7m${line}\x1b[27m\x1b[49m`
-          );
           return addHeadingSpacing(lines);
         }
 
@@ -2472,7 +2548,10 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
 
       if (token?.type !== "code") {
-        return originalRenderToken.call(this, token, width, nextTokenType, styleContext);
+        return [
+          ...originalRenderToken.call(this, token, width, nextTokenType, styleContext),
+          ...gapRowsAfterBlock(token?.type, nextTokenType),
+        ];
       }
 
       const maxWidth = Math.max(1, width);
@@ -2525,24 +2604,32 @@ export default function prettyTui(pi: ExtensionAPI) {
         (showCopyButton ? this.theme.codeBlockBorder(` ${copyLabel} `) : "") + frameBorder("╮");
       const framedCodeWidth = Math.max(1, frameWidth - 4);
       const lines = [
-        styledTopRule,
-        ...codeLines.map((line) =>
-          frameBorder("│ ") +
-          line +
-          " ".repeat(Math.max(0, framedCodeWidth - visibleWidth(line))) +
-          frameBorder(" │")
-        ),
-        frameBorder(`╰${"─".repeat(Math.max(0, frameWidth - 2))}╯`),
+        selectableRow(styledTopRule, frameWidth, []),
+        ...codeLines.map((line) => selectableRow(
+          frameBorder("│ ") + line +
+          " ".repeat(Math.max(0, framedCodeWidth - visibleWidth(line))) + frameBorder(" │"),
+          frameWidth, [[2, frameWidth - 2]])),
+        selectableRow(frameBorder(`╰${"─".repeat(Math.max(0, frameWidth - 2))}╯`), frameWidth, []),
       ];
 
       if (showCopyButton && Array.isArray(this[codeBlockCollectionKey])) {
-        this[codeBlockCollectionKey].push({
+        const descriptor = {
           buttonStart,
           buttonWidth: visibleWidth(copyLabel),
           code,
           styledTopRule,
           topRule,
-        });
+        };
+        const collection = this[codeBlockCollectionKey] as any[] & { generation: number };
+        collection.push(descriptor);
+        if (this.blockHighlightedCode) {
+          let cached = blockCopyDescriptors.get(this.blockHighlightedCode);
+          if (!cached || cached.generation !== collection.generation) {
+            cached = { generation: collection.generation, blocks: [] };
+            blockCopyDescriptors.set(this.blockHighlightedCode, cached);
+          }
+          cached.blocks.push(descriptor);
+        }
       }
       if (nextTokenType && nextTokenType !== "space") lines.push("");
       return lines;
@@ -2627,7 +2714,11 @@ export default function prettyTui(pi: ExtensionAPI) {
       this.theme.listBullet = (marker: string) =>
         originalListBullet(marker.replace(/^- /, "• "));
       try {
-        return originalRenderList.call(this, token, depth, width, styleContext);
+        if (!transcriptMarkdownActive()) {
+          return originalRenderList.call(this, token, depth, width, styleContext);
+        }
+        return renderSpacedList(token, (singleItemList) =>
+          originalRenderList.call(this, singleItemList, depth, width, styleContext));
       } finally {
         this.theme.listBullet = originalListBullet;
       }
@@ -2642,6 +2733,37 @@ export default function prettyTui(pi: ExtensionAPI) {
         markdownPrototype.renderList = patch.originalRenderList;
       }
       if (patch) delete markdownPrototype[listPatchKey];
+    });
+  }
+
+  const inlineEmphasisPatchKey = Symbol.for("pretty-tui.inline-emphasis");
+  if (config.markdownEmphasis !== "native" && !markdownPrototype[inlineEmphasisPatchKey]) {
+    const originalRenderInlineTokens = markdownPrototype.renderInlineTokens;
+    const patchedRenderInlineTokens = function (
+      this: any,
+      tokens: InlineToken[],
+      styleContext?: InlineStyleContext,
+    ): string {
+      const theme = currentExtensionUi?.theme;
+      if (!transcriptMarkdownActive() || !assistantBodyMarkdown.has(this) || !theme?.fg) {
+        return originalRenderInlineTokens.call(this, tokens, styleContext);
+      }
+      return originalRenderInlineTokens.call(
+        this,
+        tokens,
+        themedInlineContext(tokens, styleContext ?? this.getDefaultInlineStyleContext(), theme),
+      );
+    };
+
+    markdownPrototype[inlineEmphasisPatchKey] = { originalRenderInlineTokens, patchedRenderInlineTokens };
+    markdownPrototype.renderInlineTokens = patchedRenderInlineTokens;
+
+    pi.on("session_shutdown", () => {
+      const patch = markdownPrototype[inlineEmphasisPatchKey];
+      if (patch?.patchedRenderInlineTokens === markdownPrototype.renderInlineTokens) {
+        markdownPrototype.renderInlineTokens = patch.originalRenderInlineTokens;
+      }
+      if (patch) delete markdownPrototype[inlineEmphasisPatchKey];
     });
   }
 
@@ -3228,13 +3350,12 @@ export default function prettyTui(pi: ExtensionAPI) {
           if (lines.length === 0) return lines;
           contentLines = lines[0] === "" ? lines.slice(1) : lines;
         }
-        decoratedContent = contentLines.map((line: string, index: number) =>
-          truncateToWidth(
-            (index === 0 ? childPrefix : continuation) + line,
-            Math.max(1, width),
-            "",
-          )
-        );
+        decoratedContent = contentLines.map((line: string, index: number) => {
+          const prefix = index === 0 ? childPrefix : continuation;
+          const rendered = truncateToWidth(prefix + line, Math.max(1, width), "");
+          return selectionMetadataActive()
+            ? selectableRow(rendered, visibleWidth(rendered), [[visibleWidth(prefix), visibleWidth(rendered)]]) : rendered;
+        });
         if (cacheable) {
           this[cleanChildRenderCacheKey] = {
             width,

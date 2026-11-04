@@ -14,12 +14,7 @@ import {
   initTheme,
   getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, ScrollView, Text, TuiAltScreen, VStack, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { stripFrame } from "../extensions/selection-chrome.ts";
-// The suite runs in plain Node, where pi-tui's internal layout module is a
-// normal relative import. The extension itself cannot reach it through Pi's
-// module mapping, so it walks the layout tree structurally instead.
-import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
+import { Markdown, Text, TuiAltScreen, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
   ActivityTimeline,
   assistantTerminalState,
@@ -81,11 +76,11 @@ const protoPatchKeys = [
 
 const symbolPatchKeys = [
   ["TuiAltScreen", TuiAltScreen.prototype, Symbol.for("pretty-tui.clean-summary-click")],
-  ["TuiAltScreen", TuiAltScreen.prototype, Symbol.for("pretty-tui.selection-copy")],
 ].map(([label, owner, symbol]) => ({ label, owner, symbol }));
 
 const jiti = createJiti(import.meta.url);
 const extension = await jiti.import(join(process.cwd(), "extensions/index.ts"), { default: true });
+const { removeSelectionMetadata } = await jiti.import(join(process.cwd(), "extensions/selection-ranges.ts"));
 const handlers = new Map();
 const tools = new Map();
 const toolResolvers = [];
@@ -339,6 +334,29 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.ok(raw.includes("@@ raw header @@"));
   assert.ok(raw.includes("+++ file"));
   assert.ok(raw.includes("-unparsed text"));
+}
+
+// Truncating a plain argument must not reset the color of later arguments.
+{
+  const { renderThirdPartyCompact } = await jiti.import(join(process.cwd(), "extensions/tool-presentation.ts"));
+  const spans = [];
+  const muted = "\x1b[38;2;120;130;140m";
+  const summaryTheme = { bold: text => text, fg(role, text) {
+    spans.push([role, text]);
+    return (role === "muted" ? muted : "\x1b[38;2;220;220;220m") + text + "\x1b[39m";
+  } };
+  const args = Object.freeze({ command: "cd /Users/kainan/Documents/code/VibeCoding/" + "very-long-path/".repeat(6),
+    description: "下载官方中文标点恢复 INT8 权重，仅下载测试文件" });
+  const owner = { toolName: "bg_run", toolDefinition: { label: "Background Run" }, args,
+    result: { content: [{ type: "text", text: "Started background task" }] }, isPartial: false };
+  const lines = renderThirdPartyCompact(owner, 200, summaryTheme);
+  const parameters = spans.find(([role, text]) => role === "muted" && text.startsWith("("))?.[1];
+  assert.ok(parameters.includes("… · description="));
+  assert.ok(!parameters.includes("\x1b"), "plain argument truncation must not inject color resets");
+  const descriptionOffset = lines[0].indexOf("description=");
+  const codes = [...lines[0].slice(0, descriptionOffset).matchAll(/\x1b\[[0-9;]*m/g)];
+  assert.equal(codes.at(-1)[0], muted, "description retains the muted parameter color");
+  assert.equal(owner.args, args);
 }
 
 // User messages render as transparent, right-aligned chat bubbles. Short text
@@ -1719,10 +1737,10 @@ for (const name of ["find", "grep"]) {
   show("Error\nWebSocket error");
   show("Error\nfetch failed");
   show("Error\nfetch failed");
-  assert.match(plain(), /✕ Error · WebSocket error\n✕ Error · fetch failed ×2/);
+  assert.match(plain(), /✕ Error · WebSocket error\n✕ Error · fetch failed \[×2\]/);
   assert.deepEqual(children[2].render(100), []);
   show("Error\nfetch failed");
-  assert.match(plain(), /fetch failed ×3/);
+  assert.match(plain(), /fetch failed \[×3\]/);
   children.push(new Text("A message boundary", 0, 0));
   show("Error\nfetch failed");
   assert.equal((plain().match(/fetch failed/g) ?? []).length, 2);
@@ -1739,7 +1757,7 @@ for (const name of ["find", "grep"]) {
   const second = new AssistantMessageComponent(secondMessage);
   const third = new AssistantMessageComponent({ ...rawMessage, timestamp: "compact-error-3" });
   children.push(first, second, third);
-  assert.match(plain(), /✕ Error · fetch failed ×3/);
+  assert.match(plain(), /✕ Error · fetch failed \[×3\]/);
   assert.deepEqual(second.render(100), []);
   assert.deepEqual(third.render(100), []);
   assert.equal(JSON.stringify(rawMessage), rawBefore);
@@ -1759,13 +1777,211 @@ for (const name of ["find", "grep"]) {
   const restored = [first, second, third].map((component, index) => new AssistantMessageComponent({ ...rawMessage, timestamp: `restored-error-${index}` }));
   children.splice(0, children.length, ...restored);
   restored[2].render(100); // suppressed even when it renders before its owner
-  assert.match(plain(), /✕ Error · fetch failed ×3/);
+  assert.match(plain(), /✕ Error · fetch failed \[×3\]/);
   assert.equal(children.length, 3, "UI folding must not remove original components");
   const commandContext = { hasUI: true, ui: { notify() {} } };
   await commands.get("pretty-tui").handler("full", commandContext);
   assert.equal(plain().split("fetch failed").length - 1, 3);
   await commands.get("pretty-tui").handler("clean", commandContext);
-  assert.match(plain(), /fetch failed ×3/);
+  assert.match(plain(), /fetch failed \[×3\]/);
+}
+
+// AgentRouter retries differ only in their trace annotation. Compare that
+// metadata without hiding a changed failure or modifying any original text.
+{
+  const commandContext = { hasUI: true, ui: { notify() {} } };
+  const traceIds = [
+    "b8f69459365f45067c8e3844d7fe2faa",
+    "df0bc2e6508c8c9528cb836a1ec57c1e",
+    "2033eda71a0610fb6092708efe69a66b",
+    "a3096f2b17e60fe3f51445b828e7fb20",
+    "d9f00dff124f11ac5c742901cc2bbb48",
+  ];
+  const errorText = (traceId) => `AgentRouter API error (400): {"message":"Item 'msg_065583769ed9f83d006ae8c53486ec8190b66cb8fbf3b9f51d' of type 'message' was provided without its required 'reasoning' item: 'rs_065583769ed9f83d006ae8c52e20c881908d1691013d5891d7'. [trace_id=${traceId}]","type":"invalid_request_error","param":"","code":null}`;
+  const errors = traceIds.map(errorText);
+  const message = (errorMessage, index, content = []) => ({
+    role: "assistant", timestamp: `trace-retry-${index}`, stopReason: "error", errorMessage, content,
+  });
+  for (const mode of ["clean", "compact"]) {
+    await commands.get("pretty-tui").handler(mode, commandContext);
+    await emit("session_start", {}, sessionContext([]));
+    const children = [];
+    const host = {
+      ui: { requestRender() {} },
+      chatContainer: { children, addChild(component) { children.push(component); } },
+    };
+    const show = (text) => InteractiveMode.prototype.showError.call(host, text);
+    const plain = (width = 500) => children.flatMap((component) => component.render(width)).map(stripTerminalSequences).join("\n");
+    // Bind the real runtime path to this transcript, then test notifications.
+    for (const error of errors) show("Error\n" + error);
+    assert.equal((plain().match(/✕ Error/g) ?? []).length, 1, `${mode}: trace-only runtime retries must fold`);
+    assert.match(plain(), /×5/);
+    assert.ok(plain().includes(errors[0]), "the representative must retain its complete original trace and text");
+    assert.equal(children.length, 5);
+
+    // Affix matching is provider/field-name agnostic and supports multiple
+    // changing opaque IDs, not just one hard-coded trace_id replacement.
+    for (const [first, second] of [
+      ["Gateway failed [request_id=0123456789abcdef]", "Gateway failed [request_id=fedcba987654321001234567]"],
+      ["Service timeout; correlation=550e8400-e29b-41d4-a716-446655440000; retry later",
+        "Service timeout; correlation=123e4567-e89b-12d3-a456-426614174000; retry later"],
+      ['Provider rejected {"trace":"0123456789abcdef","request":"abcdef0123456789"}',
+        'Provider rejected {"trace":"fedcba9876543210","request":"9876543210abcdef"}'],
+    ]) {
+      children.length = 0;
+      show("Error\n" + first);
+      show("Error\n" + second);
+      assert.equal((plain().match(/✕ Error/g) ?? []).length, 1, `${mode}: opaque-ID affixes must fold`);
+      assert.match(plain(), /×2/);
+      assert.ok(plain().includes(first));
+    }
+    for (const [first, second] of [
+      ["Exceeded quota 1234567890123456", "Exceeded quota 1234567890123457"],
+      ["Expected revision abcdef12", "Expected revision abcdef13"],
+      ["Failure abcdef0123456789", "Failure <hex>"],
+    ]) {
+      children.length = 0;
+      show("Error\n" + first);
+      show("Error\n" + second);
+      assert.equal((plain().match(/✕ Error/g) ?? []).length, 2, `${mode}: literal content is not an opaque ID`);
+    }
+
+    const messages = errors.map((error, index) => message(error, index));
+    const before = JSON.stringify(messages);
+    const restore = () => children.splice(0, children.length, ...messages.map((value) => new AssistantMessageComponent(value)));
+    restore();
+    assert.deepEqual(children[4].render(500), [], "folding must not depend on render order");
+    assert.equal((plain().match(/✕ Error/g) ?? []).length, 1, `${mode}: trace-only assistant retries must fold`);
+    assert.match(plain(), /×5/);
+    const narrow = children[0].render(30).map(stripTerminalSequences);
+    assert.ok(narrow.every((line) => visibleWidth(line) <= 30));
+    assert.match(narrow.join("\n"), /×5/);
+    assert.equal(JSON.stringify(messages), before);
+    // Full mode is the escape hatch for every individual trace ID.
+    await commands.get("pretty-tui").handler("full", commandContext);
+    for (const traceId of traceIds) assert.ok(plain().includes(traceId));
+    assert.ok(!plain().includes("×5"));
+    await commands.get("pretty-tui").handler(mode, commandContext);
+    restore();
+    assert.match(plain(), /×5/, "reconstructed history must fold identically");
+    assert.equal(JSON.stringify(messages), before);
+
+    for (const [label, changed] of [
+      ["message identity", errors[1].replace("msg_065583", "msg_165583")],
+      ["reasoning identity", errors[1].replace("rs_065583", "rs_165583")],
+      ["HTTP status", errors[1].replace("(400)", "(500)")],
+      ["reason", errors[1].replace("was provided without", "was rejected with")],
+      ["error type", errors[1].replace("invalid_request_error", "server_error")],
+      ["code", errors[1].replace('"code":null', '"code":"different"')],
+      ["missing trace", errors[1].replace(` [trace_id=${traceIds[1]}]`, "")],
+      ["unknown annotation", errors[1].replace("trace_id=", "request_id=")],
+      ["malformed trace", errorText("not-a-trace")],
+      ["trailing detail", errors[1] + "\nA different failure detail"],
+    ]) {
+      children.splice(0, children.length,
+        new AssistantMessageComponent(message(errors[0], 0)),
+        new AssistantMessageComponent(message(changed, 1)));
+      assert.equal((plain().match(/✕ Error/g) ?? []).length, 2, `${mode}: ${label} must break the run`);
+      assert.ok(!plain().includes("×2"));
+    }
+    restore();
+    children.splice(2, 0, new Text("A transcript boundary", 0, 0));
+    assert.match(plain(), /×2/);
+    assert.match(plain(), /×3/);
+    assert.ok(!plain().includes("×5"));
+    // A runtime notification with the same body cannot join assistant errors.
+    show("Error\n" + errors[0]);
+    assert.ok(children.at(-1).render(500).length > 0);
+    show("Different title\n" + errors[1]);
+    assert.ok(children.at(-1).render(500).length > 0);
+    children.splice(0, children.length,
+      new AssistantMessageComponent(message(errors[0], 0)),
+      new AssistantMessageComponent(message(errors[1], 1, [{ type: "text", text: "Partial answer" }])));
+    assert.equal((plain().match(/✕ Error/g) ?? []).length, 2);
+    assert.ok(plain().includes("Partial answer"));
+  }
+  await commands.get("pretty-tui").handler("clean", commandContext);
+}
+
+// Repeated errors disclose every original occurrence from the visible head,
+// without triangles, numbering, indentation or mutation of native components.
+{
+  const commandContext = { hasUI: true, ui: { notify() {} } };
+  const error = (id) => `Service unavailable [trace_id=${id}]`;
+  const ids = ["0123456789abcdef", "fedcba9876543210", "abcdef0123456789", "9876543210abcdef"];
+  for (const mode of ["clean", "compact"]) for (const source of ["runtime", "assistant"]) {
+    await commands.get("pretty-tui").handler(mode, commandContext);
+    await emit("session_start", {}, sessionContext([]));
+    const children = [];
+    const host = { ui: { requestRender() {} }, chatContainer: {
+      children, addChild(component) { children.push(component); },
+    } };
+    InteractiveMode.prototype.showError.call(host, "Bind error container");
+    children.length = 0;
+    const messages = [];
+    const append = (id) => {
+      if (source === "runtime") InteractiveMode.prototype.showError.call(host, `Error\n${error(id)}`);
+      else {
+        const message = { role: "assistant", timestamp: `disclosure-${id}`, stopReason: "error", errorMessage: error(id), content: [] };
+        messages.push(message);
+        children.push(new AssistantMessageComponent(message));
+      }
+    };
+    ids.slice(0, 3).forEach(append);
+    const before = JSON.stringify(messages);
+    const head = children[0];
+    const all = (width = 120) => children.flatMap(component => component.render(width)).map(stripTerminalSequences).join("\n");
+    const label = `${mode}/${source}`;
+    const click = (motions = []) => {
+      const lines = head.render(120);
+      const plain = lines.map(stripTerminalSequences);
+      const y = plain.findIndex(line => line.includes("[×") || line.includes("[Collapse]"));
+      assert.ok(y >= 0, `${label}: clickable count is visible`);
+      const x = plain[y].indexOf(plain[y].includes("[Collapse]") ? "[Collapse]" : "[×");
+      mouseGestureFixture(head, lines, 120).gesture(x, y, motions);
+    };
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 1, label);
+    assert.ok(all().includes("[×3]"));
+    click([[5, 0]]);
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 1, `${label}: dragging does not expand`);
+    click([[1, 0]]);
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 3, `${label}: native click expands`);
+    for (const id of ids.slice(0, 3)) assert.equal(all().split(error(id)).length - 1, 1);
+    const rows = all().split("\n").filter(line => line.includes("trace_id="));
+    assert.ok(rows.every(line => line.startsWith("✕ Error · ")), `${label}: all prefixes align`);
+    assert.ok(!all().match(/[▸▾]|第\s*\d+\s*次/));
+    assert.ok(children.slice(1).every(component => component.render(120).length === 0), "only the head projects retries");
+    assert.equal(JSON.stringify(messages), before);
+    append(ids[3]);
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 4, `${label}: appended retries stay expanded`);
+    assert.ok(all().includes("[Collapse]"));
+    assert.ok(!all().includes("[×4]"));
+    for (const width of [12, 30, 80]) {
+      const rendered = children.flatMap(component => component.render(width)).map(stripTerminalSequences);
+      assert.ok(rendered.every(line => visibleWidth(line) <= width), `${label}: width ${width}`);
+      assert.ok(!rendered.join("\n").includes("…"));
+    }
+    // Resizing and switching modes do not discard the user's disclosure choice.
+    await commands.get("pretty-tui").handler("full", commandContext);
+    assert.equal((all().match(/Service unavailable/g) ?? []).length, 4);
+    for (const id of ids) assert.ok(all().includes(id));
+    assert.ok(!all().includes("[×") && !all().includes("[Collapse]"));
+    await commands.get("pretty-tui").handler(mode, commandContext);
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 4);
+    click();
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 1, `${label}: second click collapses`);
+    assert.ok(all().includes("[×4]") && !all().includes("[Collapse]"));
+    assert.ok(all().includes(ids[0]) && !all().includes(ids[1]));
+    assert.equal(children.length, 4);
+    assert.equal(head.handleMouse({ type: "click", button: "right", x: 0, y: 1, width: 120 }), undefined);
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 1);
+    // A changed reason/boundary is never pulled into an expanded projection.
+    children.splice(2, 0, new Text("A transcript boundary", 0, 0));
+    click();
+    assert.equal((all().match(/✕ Error/g) ?? []).length, 3);
+    assert.ok(!all().includes("[×4]"));
+  }
+  await commands.get("pretty-tui").handler("clean", commandContext);
 }
 
 // Regression: while the current group holds only a thought, a notification and
@@ -2178,13 +2394,13 @@ for (const name of ["find", "grep"]) {
     assert.match(all(), mode === "full" ? /info notice/ : /◇ info notice/);
     assert.match(all(), mode === "full" ? /Warning: warning notice/ : /⚠ warning notice/);
     if (mode === "full") assert.equal(all().split("SHARED_ERROR").length - 1, 2);
-    else assert.match(all(), /✕ Error · SHARED_ERROR ×2/);
+    else assert.match(all(), /✕ Error · SHARED_ERROR \[×2\]/);
     assert.ok(all().includes("SHARED_NOTICE_DETAIL"));
     assert.ok(!widgetText().includes("SHARED_ERROR"));
     for (const target of ["compact", "full", "clean"]) {
       await commands.get("pretty-tui").handler(target, commandContext);
       if (target === "full" || mode === "full") assert.equal(all().split("SHARED_ERROR").length - 1, 2);
-      else assert.match(all(), /SHARED_ERROR ×2/);
+      else assert.match(all(), /SHARED_ERROR \[×2\]/);
     }
     await commands.get("pretty-tui").handler(mode, commandContext);
     const custom = new CustomMessageComponent({ role: "custom", customType: "shared-update", content: "CUSTOM_SHARED_DETAIL", display: true, timestamp: `${mode}-custom` });
@@ -2591,53 +2807,6 @@ for (const name of ["find", "grep"]) {
   assert.equal(copies.length, beforeRegular);
 }
 
-// Copying a selection must yield content, not the frame around it. Pi rebuilds
-// copied text from the rendered buffer, so a selection spanning a framed card
-// used to carry its gutters, corners and rules into the clipboard. Verified
-// against a live fullscreen session: Pi's laid-out leaves there are `Container`
-// wrappers, not message components, so the copied text is trimmed by content
-// rather than by mapping rows back to the components that drew them.
-{
-  const copyAll = (component, width, height = 20) => {
-    const scrollView = new ScrollView(new VStack([component]), { scrollbar: "auto", primary: true });
-    const frame = renderLayoutFrame(new VStack([scrollView]), width, height, () => {});
-    const content = frame.root.children[0].scrollContentLines;
-    const screen = {
-      previousScreen: content,
-      currentLayout: frame,
-      terminal: { rows: height, columns: width },
-      getSelectionBounds: () => ({
-        start: { row: 0, col: 0, scrollView },
-        end: { row: content.length - 1, col: width - 1, scrollView },
-      }),
-    };
-    screen.getSelectionColumns = (line, row, selection) =>
-      TuiAltScreen.prototype.getSelectionColumns.call(screen, line, row, selection);
-    return TuiAltScreen.prototype.getActiveSelectionText.call(screen);
-  };
-  const ART = /[\u2502\u2503\u2551\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u256d\u256e\u2570\u256f\u2500\u2501\u2550]/u;
-
-  await emit("session_start", {}, sessionContext([]));
-  const body = "first selected line\nsecond selected line\nthird stays out";
-  // Every width: a clamp keyed to one width's padding passes narrow or wide but
-  // not both, which is how an earlier attempt passed here and failed live.
-  for (const width of [140, 120, 100, 80, 60, 40]) {
-    const copied = copyAll(new UserMessageComponent(body), width);
-    assert.equal(copied, body, `bubble at width ${width}`);
-    assert.ok(!ART.test(copied), `no border glyph may survive at width ${width}: ${JSON.stringify(copied)}`);
-  }
-
-  // A pipe in prose is content and must survive verbatim.
-  {
-    const prose = "use a | b for alternatives";
-    assert.equal(copyAll(new UserMessageComponent(prose), 100), prose, "a prose pipe must survive");
-  }
-
-  // A rule row carries a frame title, and the title is chrome, not content.
-  assert.equal(stripFrame(" \u256d\u2500 bash \u2500\u2500\u256e "), undefined);
-  assert.equal(stripFrame(" \u2502 $ echo hello  \u2502 "), "$ echo hello");
-  assert.equal(stripFrame(" \u2502 a \u2502 b \u2502 "), "a  b");
-}
 // Fullscreen Markdown shows per-block Copy controls with precise hit regions;
 // regular mode hides them and invalidation drops stale regions.
 {
@@ -2687,9 +2856,7 @@ for (const name of ["find", "grep"]) {
       handleMouse: (event) => component.handleMouse(event),
     };
   };
-  const stripControls = (line) => line
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  const stripControls = stripTerminalSequences;
 
   const headingCases = [
     ["# One", ["╔═════╗", "║ One ║", "╚═════╝"]],
@@ -2706,28 +2873,43 @@ for (const name of ["find", "grep"]) {
     assert.ok(rendered.every((line) => visibleWidth(line) <= 20));
   }
   const primaryHeading = transcriptMarkdownFixture("# Primary").render(20);
-  const secondaryHeading = transcriptMarkdownFixture("## Secondary").render(20);
   assert.ok(primaryHeading.every((line) => !line.includes("\x1b[7m")));
   assert.ok(primaryHeading[1].includes("\x1b[4m"));
-  assert.ok(secondaryHeading[0].includes("\x1b[48;5;94m"));
-  assert.ok(secondaryHeading[0].includes("\x1b[97m") && secondaryHeading[0].includes("\x1b[4m"));
-  assert.ok(!secondaryHeading[0].includes("\x1b[7m"));
-  const lightMarkdownTheme = {
-    ...markdownTheme,
-    heading: (text) => `\x1b[38;2;154;115;38m${text}\x1b[39m`,
-  };
-  const lightSecondaryHeading = transcriptMarkdownFixture(
-    "## Light",
-    lightMarkdownTheme,
-    0,
-    0,
-    { color: (text) => `\x1b[38;2;31;35;40m${text}\x1b[39m` },
-  ).render(20);
-  assert.ok(lightSecondaryHeading[0].includes("\x1b[107m"));
-  assert.ok(lightSecondaryHeading[0].includes("\x1b[7m"));
-  assert.ok(!lightSecondaryHeading[0].includes("\x1b[48;5;94m"));
-  const sixthHeading = transcriptMarkdownFixture("###### Readable").render(20);
-  assert.ok(sixthHeading[0].includes("\x1b[3m") && sixthHeading[0].includes("\x1b[90m"));
+  const headingThemes = [
+    ["dark", markdownTheme, undefined],
+    ["light", { ...markdownTheme, heading: (text) => `\x1b[38;2;154;115;38m${text}\x1b[39m` },
+      { color: (text) => `\x1b[38;2;31;35;40m${text}\x1b[39m` }],
+    ["palette", { ...markdownTheme, heading: (text) => `\x1b[38;5;141m${text}\x1b[39m` }, undefined],
+    ["default", { ...markdownTheme, heading: (text) => text }, undefined],
+  ];
+  for (const [name, headingTheme, defaultStyle] of headingThemes) {
+    for (let level = 2; level <= 6; level++) {
+      const rendered = transcriptMarkdownFixture(
+        `${"#".repeat(level)} Themed heading`, headingTheme, 0, 0, defaultStyle,
+      ).render(40);
+      const styledRows = rendered.map((row) => row
+        .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "").trimEnd());
+      const title = "Themed heading";
+      const expected = level === 2
+        ? headingTheme.heading(headingTheme.bold(headingTheme.underline(title)))
+        : level === 5
+          ? headingTheme.heading("┄┄ ") + headingTheme.heading(title) + headingTheme.heading(" ┄┄")
+          : level === 6
+            ? headingTheme.quote(headingTheme.italic(title))
+            : level === 4 ? headingTheme.heading(title) : headingTheme.heading(headingTheme.bold(title));
+      assert.deepEqual(styledRows, [expected],
+        `${name} H${level}: H2 underline, H3 bold and H4 plain retain distinct heading levels`);
+    }
+  }
+  for (const [width, expected] of [
+    [7, ["Five"]],
+    [8, ["┄┄ Fi", "   ve ┄┄"]],
+  ]) {
+    const rows = transcriptMarkdownFixture("##### Five").render(width);
+    assert.deepEqual(rows.map((row) => stripControls(row).trimEnd()), expected,
+      `H5 keeps its original decoration threshold at width ${width}`);
+    assert.ok(rows.every((row) => visibleWidth(row) <= width));
+  }
   const narrowHeading = transcriptMarkdownFixture("# Narrow heading").render(5);
   assert.ok(narrowHeading.every((line) => visibleWidth(line) <= 5));
 
@@ -2755,7 +2937,7 @@ for (const name of ["find", "grep"]) {
   assert.ok(!borderColors.some(([text]) => text.includes("[Copy]") || text.includes("const a")));
   assert.ok(lines.some((line) => line.includes("\x1b[90mts ")));
   assert.ok(lines.some((line) => line.includes("\x1b[90m [Copy] ")));
-  const plain = lines.map((line) => line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""));
+  const plain = lines.map(stripTerminalSequences);
   const headers = plain.map((line, y) => ({ line, y })).filter(({ line }) => line.includes("[Copy]"));
   assert.equal(headers.length, 2);
   assert.ok(headers.every(({ line }) => line.trimStart().startsWith("╭─")));
@@ -2838,11 +3020,7 @@ for (const name of ["find", "grep"]) {
     markdownTheme,
   ));
   const mixedCopyLines = copyMixedComponent.render(42);
-  const mixedCopyPlain = mixedCopyLines.map((line) =>
-    line
-      .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""),
-  );
+  const mixedCopyPlain = mixedCopyLines.map(stripTerminalSequences);
   const mixedCopyY = mixedCopyPlain.findIndex((line) => line.includes("[Copy]"));
   assert.ok(mixedCopyY >= 0);
   const mixedCopyX = mixedCopyPlain[mixedCopyY].indexOf("[Copy]") + 1;
@@ -2951,7 +3129,6 @@ for (const name of ["find", "grep"]) {
 }
 
 const patchedSelectionHandler = TuiAltScreen.prototype.handleSelectionMouseEvent;
-const patchedSelectionCopy = TuiAltScreen.prototype.getActiveSelectionText;
 const patchedMarkdownRenderToken = Markdown.prototype.renderToken;
 const patchedAssistantRender = AssistantMessageComponent.prototype.render;
 const patchedAssistantMouse = AssistantMessageComponent.prototype.handleMouse;
@@ -3287,8 +3464,8 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
   const panelTheme = { bold: (text) => text, fg: (_role, text) => text,
     bg: (role, text) => bg(role) + text + "\x1b[49m" };
   const panel = frameNativeRows("Assistant", ["ORIGINAL_ROW\x1b[0m TEXT"], 80, panelTheme, undefined, owner);
-  assert.ok(panel.lines.every((line) => line.trimStart().startsWith(bg("toolPendingBg"))));
-  assert.ok(panel.lines.every((line) => line.startsWith(" ") && line.endsWith(" ")), "outer gutters have terminal background, outside the panel fill");
+  assert.ok(panel.lines.every((line) => removeSelectionMetadata(line).trimStart().startsWith(bg("toolPendingBg"))));
+  assert.ok(panel.lines.every((line) => stripTerminalSequences(line).startsWith(" ") && stripTerminalSequences(line).endsWith(" ")), "outer gutters have terminal background, outside the panel fill");
   assert.ok(panel.lines.every((line) => visibleWidth(line) === 80));
   assert.equal(panel.inset, 3, "mouse offsets include margin and frame padding");
   assert.ok(panel.lines.some((line) => line.includes("\x1b[0m" + bg("toolPendingBg") + " TEXT")), "reset restores panel fill");
@@ -3310,7 +3487,7 @@ for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
   assert.ok(combined.lines.includes(image), "image payload and cursor placement remain verbatim");
   assert.equal(frameNativeToolRows("read", source, 40, panelTheme, 1, "success", toolOwner).lines, combined.lines);
   const failed = frameNativeToolRows("bash", ["command", "error detail"], 40, panelTheme, 1, "error", {}, "Took 1.2s");
-  assert.ok(failed.lines.every((line) => line.trimStart().startsWith(bg("toolErrorBg"))));
+  assert.ok(failed.lines.every((line) => removeSelectionMetadata(line).trimStart().startsWith(bg("toolErrorBg"))));
   assert.ok(stripTerminalSequences(failed.lines.at(-1)).includes("Took 1.2s"));
   const pending = frameNativeToolRows("read", ["CALL_ONLY"], 40, panelTheme, undefined, {}, "");
   assert.ok(!pending.lines.map(stripTerminalSequences).some((line) => line.includes("Output")));
@@ -4151,7 +4328,6 @@ assert.notEqual(CustomMessageComponent.prototype.render, patchedCustomMessageRen
 assert.notEqual(ToolExecutionComponent.prototype.render, patchedToolRender);
 assert.notEqual(InteractiveMode.prototype.showExtensionNotify, patchedShowExtensionNotify);
 assert.notEqual(TuiAltScreen.prototype.handleSelectionMouseEvent, patchedSelectionHandler);
-assert.notEqual(TuiAltScreen.prototype.getActiveSelectionText, patchedSelectionCopy);
 
 // Disabled startup keeps only the settings command: no tools, event handlers,
 // or prototype patches are installed. The command can persist re-enabling.
